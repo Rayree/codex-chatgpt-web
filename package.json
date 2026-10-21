@@ -23,6 +23,8 @@
     "LICENSES"
   ],
   "scripts": {
+    "chatshare": "bun run src/chatshare/cli.ts",
+    "test:chatshare": "bun test ./tests/chatshare-*.test.ts",
     "start": "bun run src/cli.ts serve",
     "setup": "bun run src/cli.ts setup",
     "doctor": "bun run src/cli.ts doctor",

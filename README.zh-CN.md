@@ -1,3 +1,5 @@
+> **本 fork 的 ChatShare 实验分支**：新增独立的网页纯文本入口，面向 macOS Apple Silicon。请先阅读 [ChatShare 使用说明](docs/chatshare.zh-CN.md)。目前不支持本地工具或图片，也未完成 Mac 真机和真实席位验证。下面原项目的安装包链接不包含这项改造。
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="切换到网页版模型，继续使用 Codex。你的 ChatGPT 订阅。你的工作流。充分发挥模型能力。">
 </p>
