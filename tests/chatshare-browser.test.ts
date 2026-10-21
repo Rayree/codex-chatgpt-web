@@ -139,6 +139,15 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
     expect(result.messages[1]!.complete).toBeTrue();
     expect(result.messages[1]!.busy).toBeFalse();
   });
+  test("a sibling toolbar belongs only to the final assistant unit in a shared turn", async () => {
+    const result = await read(`${composer}<div data-turn-key="turn-1"><div data-user-message-bubble>Question</div>
+      <div data-content-search-unit-key="thinking"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div data-markdown-text-style="assistant-message">Thinking notes</div></div>
+      <div data-content-search-unit-key="final"><h4 data-conversation-role="assistant">ChatGPT said:</h4><div data-markdown-text-style="assistant-message">Final answer</div></div>
+      <div class="turn-action-controls"><button aria-label="Copy">Copy</button></div></div>`);
+    expect(result.messages.map(item => item.text)).toEqual(["Thinking notes", "Final answer"]);
+    expect(result.messages[0]!.complete).toBeFalse();
+    expect(result.messages[1]!.complete).toBeTrue();
+  });
   test("a live thinking status prevents completion even if toolbar controls exist", async () => {
     const result = await read(`${composer}<div data-turn-key="turn-1"><div data-user-message-bubble>Q</div>
       <div data-streaming-response-status>Working</div><div data-content-search-unit-key="final"><h4 data-conversation-role="assistant"></h4><div data-markdown-text-style="assistant-message">Partial</div></div>
