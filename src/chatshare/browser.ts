@@ -108,8 +108,12 @@ export function readChatShareDom(options: { selectors: ChatShareSelectors }): Ch
     '.turn-action-controls button[aria-label="Copy"]',
     '.turn-action-controls button[aria-label="复制"]',
     '.turn-action-controls button[aria-label="重新生成回答"]',
+    'button[aria-label="复制"][data-chatshare-copy="1"]',
+    'button[aria-label="重新生成回复"]',
+    'button[aria-label="评价回复"]',
+    'button[aria-label="朗读"]',
   ].join(", ");
-  const streamingSelector = '[data-is-streaming="true"], [aria-busy="true"], [data-streaming-response-status], .result-streaming';
+  const streamingSelector = '[data-is-streaming="true"], [aria-busy="true"], [data-streaming-response-status], .result-streaming, [data-talvt-turn-state]:not([data-talvt-turn-state="complete"])';
   const messages = all.map(({ element, role }, order): ChatShareMessageSnapshot => {
     let text: string;
     let complete = false;
@@ -125,16 +129,20 @@ export function readChatShareDom(options: { selectors: ChatShareSelectors }): Ch
       text = content.map(textFrom).filter(Boolean).join("\n\n");
       // In newer renderers, the final toolbar is a sibling of the answer unit.
       // Never borrow a different assistant's toolbar from the whole conversation.
-      const turn = element.closest<HTMLElement>("[data-turn-key], [data-turn-id-container], [data-testid^='conversation-turn-'], article");
+      const turn = element.closest<HTMLElement>("[data-turn-key], [data-turn-id-container], [data-testid^='conversation-turn-'], [data-talvt-turn-state], article");
       const scope = turn ?? element.parentElement ?? element;
       const scopedAssistants = assistants.filter(candidate => scope.contains(candidate));
       const isLastInScope = scopedAssistants.at(-1) === element;
       const completionActions = isLastInScope ? select(completionSelector, scope).filter(action =>
         visible(action) && !action.closest("pre, code")
         && (element.contains(action) || Boolean(element.compareDocumentPosition(action) & 4))) : [];
-      complete = element.getAttribute("data-message-status") === "complete" || completionActions.length > 0;
+      const turnState = element.closest<HTMLElement>("[data-talvt-turn-state]")?.getAttribute("data-talvt-turn-state");
+      complete = element.getAttribute("data-message-status") === "complete"
+        || turnState === "complete"
+        || completionActions.length > 0;
       busy = select(streamingSelector, scope).some(visible)
-        || (element.matches(streamingSelector) && visible(element));
+        || (element.matches(streamingSelector) && visible(element))
+        || (turnState !== undefined && turnState !== "complete");
     }
     return { key: identity(element, role, order), role, order, text, complete, busy };
   });
@@ -396,7 +404,13 @@ export async function createChatShareBrowserController(
             throw new ChatShareBrowserError("fresh_chat_failed", "The ChatShare root did not open an empty conversation. No prompt was submitted; open a new chat manually and check compatibility.");
           }
           if (fresh.errorPresent || fresh.stopVisible) {
-            throw new ChatShareBrowserError("seat_unavailable", "ChatShare is busy or displayed an error. No prompt was submitted; inspect the browser.");
+            emptySince = undefined;
+            await page.goto(CHATSHARE_CHAT_URL, {
+              waitUntil: "domcontentloaded",
+              timeout: Math.min(15000, Math.max(1000, deadline - Date.now())),
+            });
+            await delay(config.pollIntervalMs, signal);
+            continue;
           }
           if (fresh.composerEditable && !fresh.composerText.trim()) {
             emptySince ??= Date.now();
@@ -433,15 +447,34 @@ export async function createChatShareBrowserController(
         await send.click({ timeout: Math.min(5000, Math.max(1, deadline - Date.now())), noWaitAfter: true });
         const acknowledgeDeadline = Math.min(deadline, Date.now() + 20000);
         let conversationPath: string | undefined;
+        const conversationPathKind = (path: string): "local" | "canonical" | "other" => {
+          const match = path.match(/^\/c\/([^/]+)$/);
+          if (!match) return "other";
+          let slug: string;
+          try {
+            slug = decodeURIComponent(match[1]!);
+          } catch {
+            return "other";
+          }
+          return slug.startsWith("local-chatgpt:") ? "local" : "canonical";
+        };
         while (true) {
           checkDeadline(deadline, signal);
           ensurePage(true);
           const path = new URL(page.url()).pathname;
           if (path !== "/") {
-            if (conversationPath && path !== conversationPath) {
+            if (!conversationPath) {
+              conversationPath = path;
+            } else if (
+              conversationPathKind(conversationPath) === "local"
+              && conversationPathKind(path) === "canonical"
+            ) {
+              // ChatShare creates a temporary local-chatgpt conversation first,
+              // then redirects to the canonical conversation with a different UUID.
+              conversationPath = path;
+            } else if (path !== conversationPath) {
               throw new ChatShareBrowserError("conversation_changed", "The browser switched conversations during this request. It will not be resent.");
             }
-            conversationPath = path;
           } else if (conversationPath) {
             throw new ChatShareBrowserError("conversation_changed", "The conversation closed during this request. It will not be resent.");
           }
