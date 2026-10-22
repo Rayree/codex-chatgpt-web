@@ -31,13 +31,13 @@ export interface ChatShareConfig {
 }
 
 export const DEFAULT_CHATSHARE_SELECTORS: Readonly<ChatShareSelectors> = {
-  composer: '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]',
-  sendButton: 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="发送提示"]',
-  stopButton: 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"]',
-  userMessage: '[data-message-author-role="user"], [data-user-message-bubble]',
-  assistantMessage: '[data-message-author-role="assistant"], [data-content-search-unit-key]:has([data-conversation-role="assistant"])',
+  composer: '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"], div.ProseMirror[contenteditable="true"]',
+  sendButton: 'button[data-testid="send-button"], button[aria-label="Send prompt"], button[aria-label="发送提示"], button[aria-label="发送"][type="submit"]',
+  stopButton: 'button[data-testid="stop-button"], button[aria-label="Stop generating"], button[aria-label="停止生成"], button[aria-label="停止"], button[aria-label="Stop"]',
+  userMessage: '[data-message-author-role="user"], [data-user-message-bubble], [data-content-search-unit-key$=":user"]',
+  assistantMessage: '[data-message-author-role="assistant"], [data-content-search-unit-key]:has([data-conversation-role="assistant"]), [data-content-search-unit-key$=":assistant"]',
   assistantContent: '.markdown, [data-markdown-text-style="assistant-message"]',
-  errorMessage: '[data-testid="conversation-turn-error"], [data-testid="error-message"]',
+  errorMessage: '[data-testid="conversation-turn-error"], [data-testid="error-message"], aside[role="alert"]',
 };
 
 export function chatSharePaths(env: NodeJS.ProcessEnv = process.env): { home: string; configFile: string; profileDir: string } {
