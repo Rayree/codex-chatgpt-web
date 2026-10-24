@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { CHATSHARE_MODEL_ID, DEFAULT_CHATSHARE_SELECTORS, type ChatShareConfig } from "../src/chatshare/config";
+import { CHATSHARE_CHAT_URL, CHATSHARE_MODEL_ID, DEFAULT_CHATSHARE_SELECTORS, type ChatShareConfig } from "../src/chatshare/config";
 import { createChatShareRequestHandler, startChatShareServer, type ChatShareRequestHandler } from "../src/chatshare/server";
 import type { ChatShareBrowser } from "../src/chatshare/types";
 import { ChatShareBrowserError } from "../src/chatshare/browser";
@@ -222,6 +222,84 @@ test("a prepared Plus/Pro pool permits one request per channel", async () => {
   release.resolve();
   expect((await first).status).toBe(200);
   expect((await second).status).toBe(200);
+});
+
+test.each([1, 2])("simultaneous arrivals cannot exceed HTTP capacity %i", async channelCount => {
+  const requestCount = channelCount + 1;
+  const allChecking = deferred<void>();
+  const releaseCapacity = deferred<void>();
+  const releaseRuns = deferred<void>();
+  const entered: string[] = [];
+  const completed: Response[] = [];
+  let checks = 0;
+  const browser: ChatShareBrowser = {
+    async runText(prompt) { entered.push(prompt); await releaseRuns.promise; return prompt; },
+    async close() {},
+    async status() {
+      checks++;
+      // Hold every final admission probe until all request bodies are parsed.
+      if (checks > requestCount && checks <= requestCount * 2) {
+        if (checks === requestCount * 2) allChecking.resolve();
+        await releaseCapacity.promise;
+      }
+      return {
+        state: "ready", url: CHATSHARE_CHAT_URL, message: "ready",
+        ...(channelCount === 2 ? { channels: {
+          plus: { state: "ready" as const, url: "", message: "plus", seat: "plus" as const },
+          pro: { state: "ready" as const, url: "", message: "pro", seat: "pro" as const },
+        } } : {}),
+      };
+    },
+  };
+  const handler = createChatShareRequestHandler({ ...config, turnTimeoutMs: 10000 }, browser);
+  handlers.push(handler);
+  const pending = Array.from({ length: requestCount }, (_, index) =>
+    handler.fetch(request({ model: CHATSHARE_MODEL_ID, input: `request ${index}` })).then(response => {
+      completed.push(response);
+      return response;
+    }));
+  try {
+    await allChecking.promise;
+    releaseCapacity.resolve();
+    // Drain the admission continuations while accepted requests remain held.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(entered).toHaveLength(channelCount);
+    expect(completed.map(response => response.status)).toEqual([409]);
+    expect((await completed[0]!.json() as any).error.code).toBe("chatshare_busy");
+    const health = await handler.fetch(request(undefined, { method: "GET", path: "/healthz" }));
+    expect((await health.json() as any).active_requests).toBe(channelCount);
+  } finally {
+    releaseCapacity.resolve();
+    releaseRuns.resolve();
+    await Promise.all(pending);
+  }
+  expect(completed.map(response => response.status).sort()).toEqual([...Array(channelCount).fill(200), 409]);
+  expect(entered).toHaveLength(channelCount);
+});
+
+test("shutdown during the final capacity probe refuses admission", async () => {
+  const checking = deferred<void>();
+  const release = deferred<void>();
+  let checks = 0;
+  let calls = 0;
+  const browser: ChatShareBrowser = {
+    async runText() { calls++; return "must not run"; },
+    async close() {},
+    async status() {
+      if (++checks === 2) { checking.resolve(); await release.promise; }
+      return { state: "ready", url: CHATSHARE_CHAT_URL, message: "ready" };
+    },
+  };
+  const handler = createChatShareRequestHandler(config, browser);
+  handlers.push(handler);
+  const pending = handler.fetch(request());
+  try {
+    await checking.promise;
+    await handler.stop();
+    release.resolve();
+    expect((await pending).status).toBe(503);
+    expect(calls).toBe(0);
+  } finally { release.resolve(); await pending; }
 });
 
 test("client cancellation keeps the browser reserved until physical work settles", async () => {

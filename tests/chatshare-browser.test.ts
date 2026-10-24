@@ -1,5 +1,5 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import {
   ChatShareTurnTracker,
   chatShareStatusUrl,
@@ -13,6 +13,7 @@ import {
   type ChatShareMessageSnapshot,
 } from "../src/chatshare/browser";
 import { CHATSHARE_CHAT_URL, CHATSHARE_ENTRY_URL, DEFAULT_CHATSHARE_SELECTORS, type ChatShareConfig } from "../src/chatshare/config";
+import { ChatShareChannelPool } from "../src/chatshare/pool";
 
 const message = (role: "user" | "assistant", key: string, order: number, text: string,
   extras: Partial<ChatShareMessageSnapshot> = {}): ChatShareMessageSnapshot => ({
@@ -116,6 +117,74 @@ test("re-entry clears only an exact bridge draft and preserves a real user draft
 test("seat authorization state requires re-entry without treating generic page words as expiry", () => {
   expect(seatAuthorizationRequiresReentry(snapshot([], {}))).toBeFalse();
   expect(seatAuthorizationRequiresReentry(snapshot([], { seatAuthorizationInvalid: true }))).toBeTrue();
+});
+
+test.each(["before", "after"] as const)("a browser action timeout %s a send attempt preserves the pool retry boundary", async phase => {
+  const clock = spyOn(Date, "now").mockReturnValue(0);
+  let pool: ChatShareChannelPool | undefined;
+  let draft = "";
+  let sendCalls = 0;
+  let proCalls = 0;
+  const deltas: string[] = [];
+  const failAfterDeadline = () => {
+    clock.mockReturnValue(1001);
+    // Playwright action errors are not ChatShareBrowserError instances.
+    throw new Error("Browser action exceeded its timeout");
+  };
+  const composer = {
+    isVisible: async () => true,
+    fill: async (text: string) => {
+      if (phase === "before") failAfterDeadline();
+      draft = text;
+    },
+  };
+  const send = {
+    isVisible: async () => true,
+    isEnabled: async () => true,
+    click: async () => { sendCalls++; failAfterDeadline(); },
+  };
+  const page = {
+    url: () => CHATSHARE_CHAT_URL,
+    isClosed: () => false,
+    setDefaultTimeout() {},
+    goto: async () => { draft = ""; },
+    evaluate: async () => snapshot([], { composerText: draft }),
+    locator: (selector: string) => {
+      const target = selector === DEFAULT_CHATSHARE_SELECTORS.composer ? composer
+        : selector === DEFAULT_CHATSHARE_SELECTORS.sendButton ? send : undefined;
+      return { count: async () => target ? 1 : 0, nth: () => target };
+    },
+  } as unknown as Page;
+  const context = { on() {}, route: async () => {} } as unknown as BrowserContext;
+  try {
+    const controller = await createChatShareBrowserController({
+      port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
+      turnTimeoutMs: 1000, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
+      selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
+    }, context, { page, ownsContext: false, initialOpen: false, seat: "plus" });
+    pool = new ChatShareChannelPool({
+      plus: controller,
+      pro: {
+        status: async () => ({ state: "ready", url: CHATSHARE_CHAT_URL, message: "ready", seat: "pro" }),
+        runText: async () => { proCalls++; return "Pro answer"; },
+        close: async () => {},
+      },
+    });
+    const pending = pool.runText("Only send once", { onTextDelta: text => deltas.push(text) });
+    if (phase === "after") {
+      await expect(pending).rejects.toMatchObject({ code: "timeout", submission: "unknown" });
+      expect(sendCalls).toBe(1);
+      expect(proCalls).toBe(0);
+    } else {
+      expect(await pending).toBe("Pro answer");
+      expect(sendCalls).toBe(0);
+      expect(proCalls).toBe(1);
+    }
+    expect(deltas).toEqual([]);
+  } finally {
+    clock.mockRestore();
+    await pool?.close();
+  }
 });
 
 // Real browser fixtures are completely offline. Set this to a locally installed

@@ -302,10 +302,10 @@ function cancelled(): ChatShareBrowserError {
   return new ChatShareBrowserError("cancelled", "ChatShare request cancelled. It will not be resent; the next request starts a fresh chat.");
 }
 
-function checkDeadline(deadline: number, signal?: AbortSignal): void {
+function checkDeadline(deadline: number, signal?: AbortSignal, submission: ChatShareBrowserError["submission"] = "none"): void {
   if (signal?.aborted) throw cancelled();
   if (Date.now() >= deadline) {
-    throw new ChatShareBrowserError("timeout", "ChatShare did not produce a verified completed answer before the timeout. It will not be resent.");
+    throw new ChatShareBrowserError("timeout", "ChatShare did not produce a verified completed answer before the timeout. It will not be resent.", submission);
   }
 }
 
@@ -702,7 +702,8 @@ export async function createChatShareBrowserController(
           }
           throw error;
         }
-        if (Date.now() >= deadline) checkDeadline(deadline, signal);
+        // Errors thrown from this catch bypass the submission guard above.
+        if (Date.now() >= deadline) checkDeadline(deadline, signal, attemptedSubmission ? "unknown" : "none");
         throw new ChatShareBrowserError("browser_action_failed", attemptedSubmission
           ? "The browser action failed after a send attempt. Inspect the browser; this request will not be resent."
           : "The browser action failed before sending. Inspect the browser and page selectors.", attemptedSubmission ? "unknown" : "none");

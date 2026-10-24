@@ -118,7 +118,8 @@ export function createChatShareRequestHandler(
         return errorResponse(404, "route_not_found", "Supported routes: GET /healthz, GET /v1/models, POST /v1/responses.");
       }
       if (request.method !== "POST") return errorResponse(405, "method_not_allowed", "Use POST /v1/responses.");
-      if (active.size >= await capacity()) return busy();
+      const initialCapacity = await capacity();
+      if (active.size >= initialCapacity) return busy();
       if (request.signal.aborted) return errorResponse(499, "client_cancelled", "Client cancelled request before submission.");
       if ((request.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase() !== "application/json") {
         return errorResponse(415, "unsupported_media_type", "Content-Type must be application/json.");
@@ -132,9 +133,11 @@ export function createChatShareRequestHandler(
           ? errorResponse(error.status, error.code, error.message)
           : errorResponse(400, "invalid_json", "The request body could not be read as a supported JSON request.");
       }
-      // Reading a request body yields; reserve the browser only after a second busy/shutdown check.
+      // Body parsing and capacity probes yield. Check current state and reserve
+      // without another await so simultaneous arrivals cannot overbook channels.
+      const admissionCapacity = await capacity();
       if (stopped) return errorResponse(503, "server_stopped", "The ChatShare bridge is stopping.", "server_error");
-      if (active.size >= await capacity()) return busy();
+      if (active.size >= admissionCapacity) return busy();
       if (request.signal.aborted) return errorResponse(499, "client_cancelled", "Client cancelled request before submission.");
       const abort = new AbortController();
       let settle!: () => void;
