@@ -7,10 +7,20 @@ import {
   type ChatShareConfig,
   type ChatShareSelectors,
 } from "./config";
-import type { BrowserStatus, ChatShareBrowser } from "./types";
+import type { BrowserStatus, ChatShareBrowser, ChatShareReasoningEffort, ChatShareRunOptions, ChatShareSeat } from "./types";
 
 export class ChatShareBrowserError extends Error {
-  constructor(public readonly code: string, message: string) {
+  /**
+   * `none` means the click/send action was never attempted. `unknown` means the
+   * page may have accepted it; callers must never retry that request. `confirmed`
+   * is reserved for a page acknowledgement and is not used to authorize a
+   * resend. Keeping this on the error makes the retry boundary explicit.
+   */
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly submission: "none" | "unknown" | "confirmed" = "none",
+  ) {
     super(message);
     this.name = "ChatShareBrowserError";
   }
@@ -39,6 +49,8 @@ export interface ChatShareMessageSnapshot {
   role: "user" | "assistant";
   order: number;
   text: string;
+  /** Raw DOM text used for matching collapsed user bubbles. */
+  matchText?: string;
   complete: boolean;
   busy: boolean;
 }
@@ -49,6 +61,7 @@ export interface ChatShareDomSnapshot {
   composerText: string;
   stopVisible: boolean;
   errorPresent: boolean;
+  seatAuthorizationInvalid?: boolean;
 }
 
 /**
@@ -116,10 +129,16 @@ export function readChatShareDom(options: { selectors: ChatShareSelectors }): Ch
   const streamingSelector = '[data-is-streaming="true"], [aria-busy="true"], [data-streaming-response-status], .result-streaming, [data-talvt-turn-state]:not([data-talvt-turn-state="complete"])';
   const messages = all.map(({ element, role }, order): ChatShareMessageSnapshot => {
     let text: string;
+    let matchText: string | undefined;
     let complete = false;
     let busy = false;
     if (role === "user") {
       text = textFrom(element);
+      // ChatShare visually folds long user bubbles and appends “显示更多”.
+      // `textContent` still contains the submitted text in the current DOM. Keep
+      // both forms: visible text remains useful for diagnostics while matching
+      // uses the raw content and never relies on the folded innerText length.
+      matchText = (element.textContent ?? "").replace(/\r\n?/gu, "\n").trim();
     } else {
       const content = outermost([
         ...(element.matches(selectors.assistantContent) ? [element] : []),
@@ -144,7 +163,7 @@ export function readChatShareDom(options: { selectors: ChatShareSelectors }): Ch
         || (element.matches(streamingSelector) && visible(element))
         || (turnState !== undefined && turnState !== "complete");
     }
-    return { key: identity(element, role, order), role, order, text, complete, busy };
+    return { key: identity(element, role, order), role, order, text, matchText, complete, busy };
   });
   const composer = select(selectors.composer).find(visible);
   const composerEditable = Boolean(composer
@@ -161,12 +180,59 @@ export function readChatShareDom(options: { selectors: ChatShareSelectors }): Ch
     stopVisible: select(selectors.stopButton).some(visible),
     // Upstream turn errors can be nested inside an assistant wrapper. Excluding
     // that whole wrapper would turn a failed partial answer into false success.
-    errorPresent: select(selectors.errorMessage).some(element => visible(element) && !element.closest("pre, code")),
+    errorPresent: select(selectors.errorMessage).some(element => visible(element)
+      && !element.matches("aside#cs-idle-warning[role='alert']")
+      && !element.closest("pre, code")),
+    // Do not infer expiry from generic words such as “重试” or from prompt
+    // contents. This exact page statement is the current ChatShare seat gate.
+    seatAuthorizationInvalid: (() => {
+      let bodyText = document.body?.textContent ?? "";
+      // User bubbles and the composer can legitimately contain the same words;
+      // remove those subtrees before looking for the page-level gate copy.
+      for (const user of users) bodyText = bodyText.replace(user.textContent ?? "", "");
+      const activeComposer = select(selectors.composer).find(visible);
+      if (activeComposer) {
+        bodyText = bodyText.replace(activeComposer.textContent ?? "", "");
+        if (activeComposer instanceof HTMLInputElement || activeComposer instanceof HTMLTextAreaElement) {
+          bodyText = bodyText.replace(activeComposer.value, "");
+        }
+      }
+      return (/当前席位授权已失效[，,。]?/u.test(bodyText)
+        && /返回公益首页|无法发送或读取|复制草稿/u.test(bodyText))
+        || (/seat\s+authorization\s+(?:has\s+)?expired/iu.test(bodyText)
+          && /return|re-enter|draft/iu.test(bodyText));
+    })(),
   };
 }
 
 export function normalizedChatSharePrompt(text: string): string {
   return text.replace(/\s+/gu, " ").trim();
+}
+
+/**
+ * Match a newly rendered user turn without treating a folded bubble as a
+ * different submission. A prefix is accepted only when the renderer explicitly
+ * marks the visible text as folded; arbitrary prefixes remain a hard failure.
+ */
+export function chatSharePromptMatches(observed: ChatShareMessageSnapshot, expected: string): boolean {
+  const normalizedExpected = normalizedChatSharePrompt(expected);
+  const candidates = [observed.matchText, observed.text].filter((value): value is string => Boolean(value))
+    .map(value => normalizedChatSharePrompt(value).replace(/(?:显示更多|show\s+more)$/iu, "").trim());
+  if (candidates.some(candidate => candidate === normalizedExpected)) return true;
+  const visible = normalizedChatSharePrompt(observed.text);
+  const foldedMarker = /(?:显示更多|show\s+more)$/iu;
+  if (!foldedMarker.test(visible)) return false;
+  const prefix = normalizedChatSharePrompt(visible.replace(foldedMarker, ""));
+  return prefix.length >= 64 && normalizedExpected.startsWith(prefix);
+}
+
+/** Only exact drafts created by this controller may be cleared on re-entry. */
+export function isChatShareBridgeDraft(text: string, drafts: ReadonlySet<string>): boolean {
+  return drafts.has(normalizedChatSharePrompt(text));
+}
+
+export function seatAuthorizationRequiresReentry(snapshot: ChatShareDomSnapshot): boolean {
+  return snapshot.seatAuthorizationInvalid === true;
 }
 
 export type ChatShareTurnObservation = {
@@ -189,6 +255,9 @@ export class ChatShareTurnTracker {
   }
 
   observe(snapshot: ChatShareDomSnapshot, now: number): ChatShareTurnObservation {
+    if (snapshot.seatAuthorizationInvalid) {
+      throw new ChatShareBrowserError("seat_authorization_invalid", "The ChatShare seat authorization expired. The bridge will return to the entry page and re-enter the seat.", "unknown");
+    }
     if (snapshot.errorPresent) {
       throw new ChatShareBrowserError("page_error", "ChatShare displayed a conversation error. Inspect the browser; this request was not retried.");
     }
@@ -198,7 +267,7 @@ export class ChatShareTurnTracker {
       throw new ChatShareBrowserError("ambiguous_turn", "Another user turn appeared during this request. The bridge will not guess which answer belongs to it.");
     }
     const user = newUsers[0];
-    if (!user || normalizedChatSharePrompt(user.text) !== this.expectedPrompt) {
+    if (!user || !chatSharePromptMatches(user, this.expectedPrompt)) {
       this.completeSince = undefined;
       if (this.userAcknowledged) {
         throw new ChatShareBrowserError("turn_changed", "The submitted user turn disappeared or changed. This request was not retried.");
@@ -271,7 +340,22 @@ export function shouldBlockChatShareRequest(url: string, topLevelNavigation: boo
   return (topLevelNavigation && !isChatShareUrl(url)) || officialAccountHost(url);
 }
 
-export async function openChatShareBrowser(config: ChatShareConfig): Promise<ChatShareBrowser & { openEntry(): Promise<void> }> {
+export interface ChatShareBrowserControllerOptions {
+  /** Reuse a page in a shared context for the Plus/Pro channel pool. */
+  page?: Page;
+  /** Child channel controllers must not close their shared context. */
+  ownsContext?: boolean;
+  /** Used by the channel pool, which prepares seats asynchronously. */
+  initialOpen?: boolean;
+  seat?: ChatShareSeat;
+}
+
+export interface ChatShareSeatBrowser extends ChatShareBrowser {
+  openEntry(): Promise<void>;
+  openSeat(seat: ChatShareSeat): Promise<void>;
+}
+
+export async function openChatShareBrowser(config: ChatShareConfig): Promise<ChatShareSeatBrowser> {
   const executablePath = await findChromeExecutable(config);
   if (!executablePath) {
     throw new ChatShareBrowserError("chrome_missing", "Google Chrome was not found. Install Chrome, or set chromeExecutablePath in the ChatShare config.");
@@ -297,10 +381,21 @@ export async function openChatShareBrowser(config: ChatShareConfig): Promise<Cha
 export async function createChatShareBrowserController(
   config: ChatShareConfig,
   context: BrowserContext,
-): Promise<ChatShareBrowser & { openEntry(): Promise<void> }> {
+  options: ChatShareBrowserControllerOptions = {},
+): Promise<ChatShareSeatBrowser> {
   let closed = false;
   let busy = false;
   let page: Page;
+  let selectedSeat: ChatShareSeat | undefined = options.seat;
+  let actualModel: "GPT-6" | undefined;
+  let reasoningEffort: ChatShareReasoningEffort | undefined;
+  let lastDemandAt = Date.now();
+  const bridgeDrafts = new Set<string>();
+  const ownsContext = options.ownsContext !== false;
+  const heartbeatIntervalMs = config.heartbeatIntervalMs ?? 240000;
+  const heartbeatIdleLimitMs = config.heartbeatIdleLimitMs ?? 600000;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  const lifecycleAbort = new AbortController();
   context.on("close", () => { closed = true; });
   try {
     // Top-level pages/popups must stay on ChatShare. Third-party frames (including
@@ -315,8 +410,8 @@ export async function createChatShareBrowserController(
         await route.fallback();
       }
     });
-    page = context.pages()[0] ?? await context.newPage();
-    for (const extra of context.pages()) if (extra !== page) await extra.close();
+    page = options.page ?? context.pages()[0] ?? await context.newPage();
+    if (!options.page) for (const extra of context.pages()) if (extra !== page) await extra.close();
     page.setDefaultTimeout(5000);
   } catch {
     await context.close().catch(() => {});
@@ -339,17 +434,17 @@ export async function createChatShareBrowserController(
       throw new ChatShareBrowserError("dom_unavailable", "Could not read the ChatShare page. Check the configured CSS selectors and the browser page; this request was not retried.");
     }
   };
-  const stopOnce = async (prompt: string): Promise<void> => {
+  const stopOnce = async (prompt: string, tracker: ChatShareTurnTracker): Promise<void> => {
     if (closed || page.isClosed() || !isChatShareUrl(page.url(), true)) return;
     try {
       const users = (await snapshot()).messages.filter(message => message.role === "user");
-      if (users.length !== 1 || normalizedChatSharePrompt(users[0]!.text) !== normalizedChatSharePrompt(prompt)) return;
+      if (users.length !== 1 || !chatSharePromptMatches(users[0]!, prompt) || !tracker.userAcknowledged) return;
       const button = await firstVisible(page, config.selectors.stopButton);
       if (button) await button.click({ timeout: 1500, noWaitAfter: true });
     } catch { /* Cancellation cannot safely retry or turn into another submission. */ }
   };
-  const openEntry = async (): Promise<void> => {
-    if (busy) throw new ChatShareBrowserError("busy", "Wait for or cancel the active request before opening the entry page.");
+  const openEntry = async (allowBusy = false): Promise<void> => {
+    if (busy && !allowBusy) throw new ChatShareBrowserError("busy", "Wait for or cancel the active request before opening the entry page.");
     if (closed || page.isClosed()) throw new ChatShareBrowserError("browser_closed", "The ChatShare browser is closed. Restart the bridge.");
     try {
       await page.goto(CHATSHARE_ENTRY_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
@@ -360,21 +455,103 @@ export async function createChatShareBrowserController(
     }
   };
 
-  const browser: ChatShareBrowser & { openEntry(): Promise<void> } = {
+  const seatButton = async (seat: ChatShareSeat): Promise<Locator | undefined> => {
+    const label = seat === "pro" ? /(?:继续使用|进入)\s*Pro/iu : /(?:继续使用|进入)\s*Plus/iu;
+    const buttons = page.locator("button").filter({ hasText: label });
+    for (let index = 0, count = await buttons.count(); index < count; index++) {
+      const button = buttons.nth(index);
+      if (await button.isVisible()) return button;
+    }
+    return undefined;
+  };
+
+  const configureModel = async (seat: ChatShareSeat): Promise<void> => {
+    const picker = await firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]');
+    if (!picker) throw new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker was not found. Select GPT-6 manually and retry.");
+    await picker.click({ noWaitAfter: true });
+    const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
+    if (!await model.isVisible().catch(() => false)) {
+      throw new ChatShareBrowserError("model_unavailable", "GPT-6 is not available in the selected ChatShare seat; the bridge will not switch to GPT-5.6 Sol.");
+    }
+    await model.click({ noWaitAfter: true });
+    // Pro supports Extra High (data-selected-reasoning-effort="max"). Plus
+    // exposes Instant/none and must be reported as a downgrade.
+    let effort = seat === "pro"
+      ? page.getByRole("menuitem", { name: /Extra High|最高|Max/iu }).first()
+      : page.getByRole("menuitem", { name: /即时|Instant/iu }).first();
+    if (!await effort.isVisible().catch(() => false)) {
+      await picker.click({ noWaitAfter: true }).catch(() => {});
+      effort = seat === "pro"
+        ? page.getByRole("menuitem", { name: /Extra High|最高|Max/iu }).first()
+        : page.getByRole("menuitem", { name: /即时|Instant/iu }).first();
+    }
+    if (await effort.isVisible().catch(() => false)) await effort.click({ noWaitAfter: true });
+    selectedSeat = seat;
+    actualModel = "GPT-6";
+    reasoningEffort = seat === "pro" ? "max" : "none";
+  };
+
+  const openSeat = async (seat: ChatShareSeat, recovering = false): Promise<void> => {
+    if (closed || page.isClosed()) throw new ChatShareBrowserError("browser_closed", "The ChatShare browser is closed. Restart the bridge.");
+    if (busy && !recovering) throw new ChatShareBrowserError("busy", "Wait for the active request before changing the ChatShare seat.");
+    await openEntry(recovering);
+    const deadline = config.seatWaitTimeoutMs
+      ? Date.now() + config.seatWaitTimeoutMs
+      : undefined;
+    while (true) {
+      if (closed) throw new ChatShareBrowserError("browser_closed", "The ChatShare browser is closed. Restart the bridge.");
+      const button = await seatButton(seat);
+      if (button) {
+        await button.click({ noWaitAfter: true });
+        break;
+      }
+      const body = await page.locator("body").textContent().catch(() => "") ?? "";
+      const full = /暂时满员|满员|刷新容量|refresh\s+(?:capacity|availability)/iu.test(body);
+      if (!full && deadline && Date.now() >= deadline) {
+        throw new ChatShareBrowserError("seat_unavailable", `The ${seat} ChatShare seat is not available.`, "none");
+      }
+      if (deadline && Date.now() >= deadline) {
+        throw new ChatShareBrowserError("seat_full", `The ${seat} ChatShare seat is full; it was not selected.`, "none");
+      }
+      await delay(config.seatPollIntervalMs ?? 5000, lifecycleAbort.signal);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    }
+    const chatDeadline = Date.now() + Math.min(config.turnTimeoutMs, 30000);
+    while (!isChatShareUrl(page.url(), true)) {
+      if (Date.now() >= chatDeadline) throw new ChatShareBrowserError("seat_navigation_timeout", `The ${seat} seat did not open its chat page.`, "none");
+      await delay(config.pollIntervalMs ?? 250);
+    }
+    await configureModel(seat);
+  };
+
+  heartbeatTimer = setInterval(() => {
+    if (closed || busy || !selectedSeat || Date.now() - lastDemandAt >= heartbeatIdleLimitMs) return;
+    if (!isChatShareUrl(page.url(), true)) return;
+    // A real foreground scroll is the platform's documented renewal gesture. It
+    // never touches the composer and never submits a message.
+    void page.mouse.wheel(0, 1).then(() => page.mouse.wheel(0, -1)).catch(() => {});
+  }, heartbeatIntervalMs);
+
+  const browser: ChatShareSeatBrowser = {
     openEntry,
+    openSeat,
     async status(): Promise<BrowserStatus> {
       const url = chatShareStatusUrl(page.url());
-      if (closed || page.isClosed()) return { state: "closed", url, message: "The isolated ChatShare browser is closed." };
-      if (busy) return { state: "busy", url, message: "A ChatShare request is in progress." };
-      if (!isChatShareUrl(page.url())) return { state: "unavailable", url, message: "Open the ChatShare entry page again." };
-      if (!isChatShareUrl(page.url(), true)) return { state: "entry", url, message: "Choose a Free, Plus, or Pro seat manually in this browser window." };
+      const details = { seat: selectedSeat, actualModel, reasoningEffort, healthy: false } as const;
+      if (closed || page.isClosed()) return { state: "closed", url, message: "The isolated ChatShare browser is closed.", ...details };
+      if (busy) return { state: "busy", url, message: "A ChatShare request is in progress.", ...details };
+      if (!isChatShareUrl(page.url())) return { state: "unavailable", url, message: "Open the ChatShare entry page again.", ...details };
+      if (!isChatShareUrl(page.url(), true)) return { state: "entry", url, message: "Choose a Plus or Pro seat in this browser window.", ...details };
       try {
         const state = await snapshot();
+        if (state.seatAuthorizationInvalid) {
+          return { state: "unavailable", url, message: "The ChatShare seat authorization expired; re-entry is required.", ...details };
+        }
         return state.composerEditable && !state.errorPresent && !state.stopVisible
-          ? { state: "ready", url, message: "ChatShare is ready. Each request will start a fresh chat." }
-          : { state: "unavailable", url, message: "ChatShare is not ready. Inspect the browser for a busy seat, expired session, page error, or changed selectors." };
+          ? { state: "ready", url, message: "ChatShare is ready. Each request will start a fresh chat.", ...details, healthy: true }
+          : { state: "unavailable", url, message: "ChatShare is not ready. Inspect the browser for a busy seat, expired session, page error, or changed selectors.", ...details };
       } catch {
-        return { state: "unavailable", url, message: "Could not read the ChatShare page. Inspect the browser and configured selectors." };
+        return { state: "unavailable", url, message: "Could not read the ChatShare page. Inspect the browser and configured selectors.", ...details };
       }
     },
     async runText(prompt, options): Promise<string> {
@@ -385,9 +562,12 @@ export async function createChatShareBrowserController(
       const signal = options.signal;
       const deadline = Date.now() + config.turnTimeoutMs;
       checkDeadline(deadline, signal);
+      if (!isChatShareUrl(page.url(), true) && selectedSeat) await openSeat(selectedSeat);
       ensurePage(true);
       busy = true;
+      lastDemandAt = Date.now();
       let attemptedSubmission = false;
+      let tracker: ChatShareTurnTracker | undefined;
       try {
         // Reload the chat root instead of depending on a previous conversation.
         // The adapter supplies the complete message history once in this prompt.
@@ -400,6 +580,10 @@ export async function createChatShareBrowserController(
           checkDeadline(deadline, signal);
           ensurePage(true);
           const fresh = await snapshot();
+          if (seatAuthorizationRequiresReentry(fresh)) {
+            if (selectedSeat) await openSeat(selectedSeat, true);
+            throw new ChatShareBrowserError("seat_authorization_invalid", "The ChatShare seat authorization expired. It was re-entered; this request was not resent.", "none");
+          }
           if (new URL(page.url()).pathname !== "/" || fresh.messages.length > 0) {
             throw new ChatShareBrowserError("fresh_chat_failed", "The ChatShare root did not open an empty conversation. No prompt was submitted; open a new chat manually and check compatibility.");
           }
@@ -411,6 +595,18 @@ export async function createChatShareBrowserController(
             });
             await delay(config.pollIntervalMs, signal);
             continue;
+          }
+          if (fresh.composerEditable && fresh.composerText.trim()) {
+            const draft = normalizedChatSharePrompt(fresh.composerText);
+            // A previous bridge attempt may leave its prompt in a newly entered
+            // seat. Clear only that exact bridge-owned draft; a user draft is
+            // preserved and causes a safe not_ready result.
+            if (isChatShareBridgeDraft(draft, bridgeDrafts)) {
+              const staleComposer = await firstVisible(page, config.selectors.composer);
+              if (staleComposer) await staleComposer.fill("");
+              await delay(config.pollIntervalMs, signal);
+              continue;
+            }
           }
           if (fresh.composerEditable && !fresh.composerText.trim()) {
             emptySince ??= Date.now();
@@ -428,6 +624,7 @@ export async function createChatShareBrowserController(
         checkDeadline(deadline, signal);
         ensurePage(true);
         await composer.fill(prompt, { timeout: Math.min(5000, Math.max(1, deadline - Date.now())) });
+        bridgeDrafts.add(normalizedChatSharePrompt(prompt));
         checkDeadline(deadline, signal);
         const baseline = await snapshot();
         if (baseline.messages.length || baseline.stopVisible || baseline.errorPresent
@@ -438,7 +635,7 @@ export async function createChatShareBrowserController(
         if (!send || !await send.isEnabled()) {
           throw new ChatShareBrowserError("send_unavailable", "The ChatShare send button is unavailable. No send action was attempted; inspect the browser and selectors.");
         }
-        const tracker = new ChatShareTurnTracker(baseline, prompt, config.stableIntervalMs);
+        tracker = new ChatShareTurnTracker(baseline, prompt, config.stableIntervalMs);
         checkDeadline(deadline, signal);
         ensurePage(true);
         attemptedSubmission = true;
@@ -485,6 +682,7 @@ export async function createChatShareBrowserController(
             // Buffer until verified completion. A single append is prefix-safe
             // even when the upstream page rewrites paragraphs while thinking.
             options.onTextDelta?.(answer);
+            bridgeDrafts.delete(normalizedChatSharePrompt(prompt));
             return answer;
           }
           if (!tracker.userAcknowledged && Date.now() >= acknowledgeDeadline) {
@@ -493,13 +691,21 @@ export async function createChatShareBrowserController(
           await delay(config.pollIntervalMs, signal);
         }
       } catch (error) {
-        if (attemptedSubmission) await stopOnce(prompt);
-        if (signal?.aborted) throw cancelled();
-        if (error instanceof ChatShareBrowserError) throw error;
+        // A click followed by a timeout/502/seat error is intentionally left
+        // running: the page may have accepted it. Only an explicit client
+        // cancellation after a matched user turn may use Stop.
+        if (signal?.aborted && attemptedSubmission && tracker?.userAcknowledged) await stopOnce(prompt, tracker);
+        if (signal?.aborted) throw new ChatShareBrowserError("cancelled", "ChatShare request cancelled. It will not be resent; inspect the page before retrying.", attemptedSubmission ? "unknown" : "none");
+        if (error instanceof ChatShareBrowserError) {
+          if (attemptedSubmission && error.submission === "none") {
+            throw new ChatShareBrowserError(error.code, error.message, "unknown");
+          }
+          throw error;
+        }
         if (Date.now() >= deadline) checkDeadline(deadline, signal);
         throw new ChatShareBrowserError("browser_action_failed", attemptedSubmission
           ? "The browser action failed after a send attempt. Inspect the browser; this request will not be resent."
-          : "The browser action failed before sending. Inspect the browser and page selectors.");
+          : "The browser action failed before sending. Inspect the browser and page selectors.", attemptedSubmission ? "unknown" : "none");
       } finally {
         busy = false;
       }
@@ -507,14 +713,66 @@ export async function createChatShareBrowserController(
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
-      await context.close();
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      lifecycleAbort.abort();
+      if (ownsContext) await context.close();
     },
   };
   try {
-    await openEntry();
+    if (options.initialOpen !== false) await openEntry();
     return browser;
   } catch (error) {
     await browser.close().catch(() => {});
     throw error;
+  }
+}
+
+/** Launch one isolated profile with independent foreground pages for Plus and Pro. */
+export async function openChatShareChannelPool(config: ChatShareConfig): Promise<ChatShareBrowser> {
+  const executablePath = await findChromeExecutable(config);
+  if (!executablePath) {
+    throw new ChatShareBrowserError("chrome_missing", "Google Chrome was not found. Install Chrome, or set chromeExecutablePath in the ChatShare config.");
+  }
+  await mkdir(config.profileDir, { recursive: true, mode: 0o700 });
+  let context: BrowserContext | undefined;
+  try {
+    context = await chromium.launchPersistentContext(config.profileDir, {
+      executablePath,
+      headless: false,
+      chromiumSandbox: true,
+      viewport: { width: 1280, height: 900 },
+      acceptDownloads: false,
+      serviceWorkers: "block",
+    });
+    const plusPage = context.pages()[0] ?? await context.newPage();
+    const proPage = await context.newPage();
+    const plus = await createChatShareBrowserController(config, context, {
+      page: plusPage, ownsContext: false, initialOpen: false, seat: "plus",
+    });
+    const pro = await createChatShareBrowserController(config, context, {
+      page: proPage, ownsContext: false, initialOpen: false, seat: "pro",
+    });
+    const { ChatShareChannelPool } = await import("./pool");
+    const pool = new ChatShareChannelPool({ plus, pro }, { waitIntervalMs: config.pollIntervalMs });
+    // Plus is the startup gate because it is the ordinary route. Pro enters in
+    // the background and keeps polling a full capacity page until a seat opens.
+    const proPreparation = pro.openSeat("pro").catch(() => undefined);
+    try {
+      await plus.openSeat("plus");
+    } catch (error) {
+      await pool.close().catch(() => {});
+      await context.close().catch(() => {});
+      throw error;
+    }
+    void proPreparation;
+    return {
+      runText: (prompt, options) => pool.runText(prompt, options),
+      status: () => pool.status(),
+      close: async () => { await pool.close(); await context!.close().catch(() => {}); },
+    };
+  } catch (error) {
+    if (context) await context.close().catch(() => {});
+    if (error instanceof ChatShareBrowserError) throw error;
+    throw new ChatShareBrowserError("launch_failed", "Could not prepare the Plus and Pro ChatShare channels.");
   }
 }

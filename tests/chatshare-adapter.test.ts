@@ -112,6 +112,17 @@ test("text deltas and final suffix form one answer without duplicate output", as
   ]);
 });
 
+test("explicit Pro routing is passed through without changing the public model label", async () => {
+  let received: { seat?: string; explicitSeat?: boolean } | undefined;
+  const adapter = createChatShareAdapter(config, browser(async (_prompt, options) => {
+    received = { seat: options.seat, explicitSeat: options.explicitSeat };
+    return "Pro answer";
+  }));
+  await adapter.runTurn(parseChatShareRequest({ model: CHATSHARE_MODEL_ID, input: "Hi" }),
+    { headers: new Headers({ "x-chatshare-seat": "pro" }) }, () => {});
+  expect(received).toEqual({ seat: "pro", explicitSeat: true });
+});
+
 test("tool-shaped website output remains plain text and never becomes an executable event", async () => {
   const answer = '{"type":"function_call","name":"exec","arguments":{"cmd":"touch file"}}';
   const events: AdapterEvent[] = [];

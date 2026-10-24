@@ -72,10 +72,16 @@ export function createChatShareRequestHandler(
 ): ChatShareRequestHandler {
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(config.token)) throw new Error("ChatShare requires a valid random local bearer token.");
   const adapter = createChatShareAdapter(config, browser);
-  let active: ActiveRequest | undefined;
+  const active = new Set<ActiveRequest>();
   let stopped = false;
   let stopping: Promise<void> | undefined;
   const busy = () => errorResponse(409, "chatshare_busy", "A browser request is already running. Wait for it to settle; this request was not queued or sent.");
+  const capacity = async (): Promise<number> => {
+    try {
+      const state = await browser.status();
+      return Math.max(1, state.channels ? Object.keys(state.channels).length : 1);
+    } catch { return 1; }
+  };
 
   return {
     async fetch(request) {
@@ -96,7 +102,7 @@ export function createChatShareRequestHandler(
         catch { browserState = { state: "unavailable", url: "", message: "Browser status is unavailable." }; }
         return Response.json({
           status: "ok", service: "chatshare-web-experimental", mode: "text-only", model: CHATSHARE_MODEL_ID,
-          busy: active !== undefined, browser: browserState,
+          busy: active.size > 0, active_requests: active.size, browser: browserState,
         }, { headers: { "cache-control": "no-store" } });
       }
       if (request.method === "GET" && url.pathname === "/v1/models") {
@@ -112,7 +118,7 @@ export function createChatShareRequestHandler(
         return errorResponse(404, "route_not_found", "Supported routes: GET /healthz, GET /v1/models, POST /v1/responses.");
       }
       if (request.method !== "POST") return errorResponse(405, "method_not_allowed", "Use POST /v1/responses.");
-      if (active) return busy();
+      if (active.size >= await capacity()) return busy();
       if (request.signal.aborted) return errorResponse(499, "client_cancelled", "Client cancelled request before submission.");
       if ((request.headers.get("content-type") ?? "").split(";", 1)[0]!.trim().toLowerCase() !== "application/json") {
         return errorResponse(415, "unsupported_media_type", "Content-Type must be application/json.");
@@ -128,12 +134,12 @@ export function createChatShareRequestHandler(
       }
       // Reading a request body yields; reserve the browser only after a second busy/shutdown check.
       if (stopped) return errorResponse(503, "server_stopped", "The ChatShare bridge is stopping.", "server_error");
-      if (active) return busy();
+      if (active.size >= await capacity()) return busy();
       if (request.signal.aborted) return errorResponse(499, "client_cancelled", "Client cancelled request before submission.");
       const abort = new AbortController();
       let settle!: () => void;
       const task: ActiveRequest = { abort, settled: new Promise<void>(resolve => { settle = resolve; }) };
-      active = task;
+      active.add(task);
       const queue = new AsyncEventQueue<AdapterEvent>();
       const onClientAbort = () => abort.abort(new ChatShareRequestError(
         "Client cancelled request; no automatic resend was attempted.", "client_cancelled", 499,
@@ -153,7 +159,7 @@ export function createChatShareRequestHandler(
           clearTimeout(timeout);
           request.signal.removeEventListener("abort", onClientAbort);
           queue.close();
-          if (active === task) active = undefined;
+          active.delete(task);
           settle();
         }
       };
@@ -183,6 +189,15 @@ export function createChatShareRequestHandler(
       if (terminalFailure) events.push(terminalFailure);
       const response = buildResponseJSON(events, CHATSHARE_MODEL_ID, { hideThinkingSummary: true });
       response.usage = null;
+      try {
+        const browserState = await browser.status();
+        (response as Record<string, unknown>).chatshare = {
+          seat: browserState.seat ?? null,
+          actual_model: browserState.actualModel ?? null,
+          reasoning_effort: browserState.reasoningEffort ?? null,
+          channels: browserState.channels ?? null,
+        };
+      } catch { /* The response remains valid if the browser closes while settling. */ }
       return Response.json(response, {
         status: terminalFailure?.status ?? 200,
         headers: { "cache-control": "no-store", "x-chatshare-usage": "unavailable", "x-content-type-options": "nosniff" },
@@ -191,11 +206,11 @@ export function createChatShareRequestHandler(
     stop() {
       if (stopping) return stopping;
       stopped = true;
-      const pending = active;
-      pending?.abort.abort(new ChatShareRequestError("The ChatShare bridge is shutting down.", "server_stopped", 503));
+      const pending = [...active];
+      for (const task of pending) task.abort.abort(new ChatShareRequestError("The ChatShare bridge is shutting down.", "server_stopped", 503));
       stopping = (async () => {
         await browser.close();
-        await pending?.settled;
+        await Promise.all(pending.map(task => task.settled));
       })();
       return stopping;
     },

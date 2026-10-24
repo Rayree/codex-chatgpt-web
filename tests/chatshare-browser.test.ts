@@ -4,8 +4,10 @@ import {
   ChatShareTurnTracker,
   chatShareStatusUrl,
   createChatShareBrowserController,
+  isChatShareBridgeDraft,
   isChatShareUrl,
   readChatShareDom,
+  seatAuthorizationRequiresReentry,
   shouldBlockChatShareRequest,
   type ChatShareDomSnapshot,
   type ChatShareMessageSnapshot,
@@ -97,6 +99,25 @@ test("interfering turns, lost acknowledgement, and upstream errors fail explicit
   expect(() => new ChatShareTurnTracker(snapshot(), "Q", 500).observe(snapshot([], { errorPresent: true }), 0)).toThrow("conversation error");
 });
 
+test("long folded user bubbles still acknowledge the exact submitted prompt", () => {
+  const prompt = "P".repeat(2400);
+  const tracker = new ChatShareTurnTracker(snapshot(), prompt, 50);
+  const folded = snapshot([message("user", "u", 0, `${prompt.slice(0, 1570)}显示更多`)]);
+  expect(tracker.observe(folded, 0).phase).toBe("waiting-answer");
+  expect(tracker.userAcknowledged).toBeTrue();
+});
+
+test("re-entry clears only an exact bridge draft and preserves a real user draft", () => {
+  const bridgeDrafts = new Set(["bridge prompt"]);
+  expect(isChatShareBridgeDraft("bridge\n prompt", bridgeDrafts)).toBeTrue();
+  expect(isChatShareBridgeDraft("a user draft", bridgeDrafts)).toBeFalse();
+});
+
+test("seat authorization state requires re-entry without treating generic page words as expiry", () => {
+  expect(seatAuthorizationRequiresReentry(snapshot([], {}))).toBeFalse();
+  expect(seatAuthorizationRequiresReentry(snapshot([], { seatAuthorizationInvalid: true }))).toBeTrue();
+});
+
 // Real browser fixtures are completely offline. Set this to a locally installed
 // Chrome/Chromium binary; no authenticated profile or live seat is used.
 const chrome = process.env.CHATSHARE_TEST_CHROME;
@@ -161,6 +182,14 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
       <button data-testid="copy-turn-action-button">Copy</button></article>`);
     expect(result.errorPresent).toBeTrue();
     expect(() => new ChatShareTurnTracker(snapshot(), "Q", 500).observe(result, 10000)).toThrow("conversation error");
+  });
+  test("the idle renewal warning is not treated as a conversation error", async () => {
+    const result = await read(`${composer}<aside id="cs-idle-warning" role="alert">无操作约 10 分钟</aside>`);
+    expect(result.errorPresent).toBeFalse();
+  });
+  test("seat expiry detection ignores matching words in the composer draft", async () => {
+    const result = await read(`<textarea id="prompt-textarea">当前席位授权已失效，请重试</textarea>`);
+    expect(result.seatAuthorizationInvalid).toBeFalse();
   });
   test("old assistant controls cannot complete the new answer and hidden messages are ignored", async () => {
     const result = await read(`${composer}<article data-testid="conversation-turn-old"><div data-message-author-role="assistant"><div class="markdown">Old</div></div><button data-testid="copy-turn-action-button">Copy</button></article>
@@ -285,7 +314,10 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toContain("timeout");
       expect(deltas).toEqual([]);
-      expect(fixture.events).toEqual(["send:pending timeout", "stop:pending timeout"]);
+      // The click may already have been accepted. A timeout is therefore
+      // submission-uncertain and must not press Stop or cause a resend.
+      expect(fixture.events).toEqual(["send:pending timeout"]);
     } finally { await fixture.controller.close(); }
   });
+
 });

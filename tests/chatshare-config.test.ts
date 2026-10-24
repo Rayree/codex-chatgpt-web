@@ -43,6 +43,10 @@ test("configuration validation rejects unsafe and unsupported settings", () => {
   expect(() => parseChatShareConfig({ ...valid, selectors: { composer: "" } }, "/profile")).toThrow("invalid selector");
   expect(() => parseChatShareConfig({ ...valid, chromeExecutablePath: "relative/chrome" }, "/profile")).toThrow("absolute path");
   expect(parseChatShareConfig({ ...valid, selectors: { composer: "#editor" } }, "/profile").selectors.composer).toBe("#editor");
+  const prepared = parseChatShareConfig(valid, "/profile");
+  expect(prepared.seatPollIntervalMs).toBe(5000);
+  expect(prepared.heartbeatIntervalMs).toBe(240000);
+  expect(prepared.heartbeatIdleLimitMs).toBe(600000);
 });
 
 test("load rejects broadly readable key files and reports missing configuration clearly", async () => {

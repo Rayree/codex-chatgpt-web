@@ -158,11 +158,17 @@ export function createChatShareAdapter(config: ChatShareConfig, browser: ChatSha
     async runTurn(parsed, incoming, emit) {
       const prompt = compileChatShareTextPrompt(parsed, config.maxPromptChars);
       incoming.abortSignal?.throwIfAborted();
+      const requestedSeat = incoming.headers.get("x-chatshare-seat")?.trim().toLowerCase();
+      if (requestedSeat && requestedSeat !== "plus" && requestedSeat !== "pro") {
+        throw new ChatShareRequestError("x-chatshare-seat must be plus or pro.", "invalid_seat", 400);
+      }
       let emittedText = "";
       let settled = false;
       try {
         const answer = await browser.runText(prompt, {
           signal: incoming.abortSignal,
+          seat: requestedSeat as "plus" | "pro" | undefined,
+          explicitSeat: requestedSeat === "pro",
           onTextDelta(delta) {
             if (settled) return;
             incoming.abortSignal?.throwIfAborted();

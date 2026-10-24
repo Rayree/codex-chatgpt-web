@@ -27,6 +27,14 @@ export interface ChatShareConfig {
   pollIntervalMs: number;
   stableIntervalMs: number;
   maxPromptChars: number;
+  /** How often a full seat page is checked while capacity is unavailable. */
+  seatPollIntervalMs?: number;
+  /** Optional bounded wait used by tests or operators; zero means keep waiting. */
+  seatWaitTimeoutMs?: number;
+  /** Foreground scroll interval used for idle seat renewal. */
+  heartbeatIntervalMs?: number;
+  /** Stop renewing a channel after this much demand-free time. */
+  heartbeatIdleLimitMs?: number;
   selectors: ChatShareSelectors;
 }
 
@@ -37,7 +45,10 @@ export const DEFAULT_CHATSHARE_SELECTORS: Readonly<ChatShareSelectors> = {
   userMessage: '[data-message-author-role="user"], [data-user-message-bubble], [data-content-search-unit-key$=":user"]',
   assistantMessage: '[data-message-author-role="assistant"], [data-content-search-unit-key]:has([data-conversation-role="assistant"]), [data-content-search-unit-key$=":assistant"]',
   assistantContent: '.markdown, [data-markdown-text-style="assistant-message"]',
-  errorMessage: '[data-testid="conversation-turn-error"], [data-testid="error-message"], aside[role="alert"]',
+  // ChatShare's idle-renewal notice is an aside#cs-idle-warning[role=alert], not
+  // a conversation error. Keep generic alerts out of the default selector and
+  // explicitly exclude that known notice when a caller supplies a broad one.
+  errorMessage: '[data-testid="conversation-turn-error"], [data-testid="error-message"], [role="alert"]:not(#cs-idle-warning)',
 };
 
 export function chatSharePaths(env: NodeJS.ProcessEnv = process.env): { home: string; configFile: string; profileDir: string } {
@@ -60,7 +71,7 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
     throw new Error("ChatShare config must be a JSON object.");
   }
   const input = raw as Record<string, unknown>;
-  const allowed = new Set(["version", "port", "token", "chromeExecutablePath", "turnTimeoutMs", "pollIntervalMs", "stableIntervalMs", "maxPromptChars", "selectors"]);
+  const allowed = new Set(["version", "port", "token", "chromeExecutablePath", "turnTimeoutMs", "pollIntervalMs", "stableIntervalMs", "maxPromptChars", "seatPollIntervalMs", "seatWaitTimeoutMs", "heartbeatIntervalMs", "heartbeatIdleLimitMs", "selectors"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new Error(`ChatShare config: unknown field ${key}.`);
   }
@@ -89,6 +100,10 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
   }
   const pollIntervalMs = integerSetting(input.pollIntervalMs, 250, "pollIntervalMs", 100, 5000);
   const stableIntervalMs = integerSetting(input.stableIntervalMs, 1500, "stableIntervalMs", 500, 10000);
+  const seatPollIntervalMs = integerSetting(input.seatPollIntervalMs, 5000, "seatPollIntervalMs", 250, 60000);
+  const seatWaitTimeoutMs = integerSetting(input.seatWaitTimeoutMs, 0, "seatWaitTimeoutMs", 0, 86400000);
+  const heartbeatIntervalMs = integerSetting(input.heartbeatIntervalMs, 240000, "heartbeatIntervalMs", 1000, 3600000);
+  const heartbeatIdleLimitMs = integerSetting(input.heartbeatIdleLimitMs, 600000, "heartbeatIdleLimitMs", 1000, 86400000);
   return {
     port: integerSetting(input.port, 3211, "port", 1024, 65535),
     token: input.token,
@@ -97,6 +112,10 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
     turnTimeoutMs: integerSetting(input.turnTimeoutMs, 180000, "turnTimeoutMs", 10000, 1800000),
     pollIntervalMs,
     stableIntervalMs,
+    seatPollIntervalMs,
+    seatWaitTimeoutMs,
+    heartbeatIntervalMs,
+    heartbeatIdleLimitMs,
     maxPromptChars: integerSetting(input.maxPromptChars, 24000, "maxPromptChars", 1000, 100000),
     selectors,
   };

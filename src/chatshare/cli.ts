@@ -166,12 +166,16 @@ export async function main(args: string[]): Promise<number> {
     await sendChat(config, prompt);
     return 0;
   }
-  const { openChatShareBrowser } = await import("./browser");
-  const browser = await openChatShareBrowser(config);
+  const browserModule = await import("./browser");
+  // `serve` prepares independent Plus and Pro foreground pages. `login` keeps
+  // the one-page manual flow so a user can inspect and choose a seat first.
+  const browser = command === "serve"
+    ? await browserModule.openChatShareChannelPool(config)
+    : await browserModule.openChatShareBrowser(config);
   let server: { stop(): Promise<void> } | undefined;
   try {
     if (command === "login") {
-      await browser.openEntry();
+      if ("openEntry" in browser && typeof browser.openEntry === "function") await browser.openEntry();
       console.log("Choose an available seat using the normal ChatShare webpage, then confirm the chat composer is usable.");
       console.log("Press Ctrl-C here to close Chrome and save this isolated browser session. Next: bun run chatshare serve");
     } else {

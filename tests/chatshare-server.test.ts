@@ -195,6 +195,35 @@ test("busy browser requests fail with 409 instead of queueing another submission
   expect((await health.json() as any).busy).toBe(false);
 });
 
+test("a prepared Plus/Pro pool permits one request per channel", async () => {
+  const entered: string[] = [];
+  const release = deferred<void>();
+  const browser: ChatShareBrowser = {
+    async runText(prompt) { entered.push(prompt); await release.promise; return prompt; },
+    async close() {},
+    async status() {
+      return {
+        state: "ready", url: "https://chat.chatshare.tv/", message: "pool", healthy: true,
+        channels: {
+          plus: { state: "ready", url: "", message: "plus", seat: "plus" },
+          pro: { state: "ready", url: "", message: "pro", seat: "pro" },
+        },
+      };
+    },
+  };
+  const handler = createChatShareRequestHandler(config, browser);
+  handlers.push(handler);
+  const first = handler.fetch(request({ model: CHATSHARE_MODEL_ID, input: "first" }));
+  const second = handler.fetch(request({ model: CHATSHARE_MODEL_ID, input: "second" }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(entered).toHaveLength(2);
+  expect(entered.some(value => value.includes("first"))).toBeTrue();
+  expect(entered.some(value => value.includes("second"))).toBeTrue();
+  release.resolve();
+  expect((await first).status).toBe(200);
+  expect((await second).status).toBe(200);
+});
+
 test("client cancellation keeps the browser reserved until physical work settles", async () => {
   const entered = deferred<void>();
   const aborted = deferred<void>();
