@@ -54,7 +54,9 @@ export class ChatShareChannelPool implements ChatShareBrowser {
         try { status = await browser.status(); }
         catch { continue; }
         if (signal?.aborted) throw new ChatShareBrowserError("cancelled", "ChatShare request cancelled while waiting for a channel.");
-        if (status.state !== "ready") continue;
+        // Another acquisition may have reserved this seat while status() was
+        // pending. Recheck and claim it without an intervening await.
+        if (status.state !== "ready" || this.reserved.has(seat)) continue;
         this.reserved.add(seat);
         return { seat, browser };
       }
