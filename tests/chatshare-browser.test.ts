@@ -193,12 +193,13 @@ const chrome = process.env.CHATSHARE_TEST_CHROME;
 describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
   let browser: Browser;
   let page: Page;
+  // Cold Chrome startup can exceed Bun's default five-second hook timeout.
   beforeAll(async () => {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
     const context = await browser.newContext();
     await context.route("**/*", route => route.abort());
     page = await context.newPage();
-  });
+  }, 60_000);
   afterAll(async () => { await browser?.close(); });
   const read = async (html: string) => {
     await page.setContent(html);
