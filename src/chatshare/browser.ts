@@ -484,28 +484,41 @@ export async function createChatShareBrowserController(
   };
 
   const configureModel = async (seat: ChatShareSeat, deadline: number): Promise<void> => {
-    // The chat URL can arrive before profile loading renders the controls.
+    const profileLoading = page.getByText(/^(?:正在加载个人资料|Loading (?:your )?profile)[.\u2026]*$/iu).first();
+    const profileReady = async (): Promise<boolean> => {
+      if (await profileLoading.isVisible()) return false;
+      const state = await snapshot();
+      return state.composerEditable && !state.errorPresent && !state.seatAuthorizationInvalid;
+    };
+    // A visible picker alone does not mean profile/menu data has hydrated.
     const picker = await waitForModelControl(
-      () => firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]'), deadline,
+      async () => await profileReady() ? firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]') : undefined, deadline,
       new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker did not become ready before the timeout. No prompt was submitted."),
     );
     await picker.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
     let reopenAfter = Date.now() + 1000;
+    let refreshAfter = Date.now() + 3000;
     const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
     await waitForModelControl(
       async () => {
-        if (await model.isVisible()) return model;
+        if (await profileLoading.isVisible()) return undefined;
+        if (await model.isVisible() && await model.isEnabled()) return model;
         if (Date.now() < reopenAfter) return undefined;
-        // Profile loading can close or replace the menu after the first click.
-        // Leave an open menu alone while its options load; reopen a closed one.
-        if (await firstVisible(page, '[role="menu"], [role="menuitemradio"]')) return undefined;
+        // An early menu can stay open with stale options. Give it time to load,
+        // then close it and reopen on the next poll without extending deadline.
+        const menuOpen = Boolean(await firstVisible(page, '[role="menu"], [role="menuitemradio"]'));
+        if (menuOpen && Date.now() < refreshAfter) return undefined;
+        // Modal menus may hide the composer from accessibility while open.
+        if (!menuOpen && !await profileReady()) return undefined;
         const currentPicker = await firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]');
         if (!currentPicker || !await currentPicker.isEnabled()) return undefined;
         ensurePage(true);
         const remaining = deadline - Date.now();
         if (remaining <= 0) return undefined;
         reopenAfter = Date.now() + 1000;
-        await currentPicker.click({ noWaitAfter: true, timeout: Math.min(1000, remaining) });
+        refreshAfter = Date.now() + 3000;
+        if (menuOpen) await currentPicker.press("Escape", { timeout: Math.min(1000, remaining) });
+        else await currentPicker.click({ noWaitAfter: true, timeout: Math.min(1000, remaining) });
         return undefined;
       }, deadline,
       new ChatShareBrowserError("model_unavailable", "GPT-6 did not become ready in the selected ChatShare seat before the timeout; the bridge will not switch to GPT-5.6 Sol."),
@@ -783,6 +796,8 @@ export async function openChatShareChannelPool(config: ChatShareConfig): Promise
   }
   await mkdir(config.profileDir, { recursive: true, mode: 0o700 });
   let context: BrowserContext | undefined;
+  let plus: ChatShareSeatBrowser | undefined;
+  let pro: ChatShareSeatBrowser | undefined;
   try {
     context = await chromium.launchPersistentContext(config.profileDir, {
       executablePath,
@@ -793,32 +808,28 @@ export async function openChatShareChannelPool(config: ChatShareConfig): Promise
       serviceWorkers: "block",
     });
     const plusPage = context.pages()[0] ?? await context.newPage();
-    const proPage = await context.newPage();
-    const plus = await createChatShareBrowserController(config, context, {
+    plus = await createChatShareBrowserController(config, context, {
       page: plusPage, ownsContext: false, initialOpen: false, seat: "plus",
     });
-    const pro = await createChatShareBrowserController(config, context, {
+    // Finish Plus before another page can steal focus or enter a seat using
+    // this profile. Pro still prepares in the background after startup.
+    await plus.openSeat("plus");
+    const proPage = await context.newPage();
+    pro = await createChatShareBrowserController(config, context, {
       page: proPage, ownsContext: false, initialOpen: false, seat: "pro",
     });
     const { ChatShareChannelPool } = await import("./pool");
     const pool = new ChatShareChannelPool({ plus, pro }, { waitIntervalMs: config.pollIntervalMs });
-    // Plus is the startup gate because it is the ordinary route. Pro enters in
-    // the background and keeps polling a full capacity page until a seat opens.
-    const proPreparation = pro.openSeat("pro").catch(() => undefined);
-    try {
-      await plus.openSeat("plus");
-    } catch (error) {
-      await pool.close().catch(() => {});
-      await context.close().catch(() => {});
-      throw error;
-    }
-    void proPreparation;
+    // A full Pro seat must not hold up the ready Plus channel.
+    void pro.openSeat("pro").catch(() => undefined);
     return {
       runText: (prompt, options) => pool.runText(prompt, options),
       status: () => pool.status(),
       close: async () => { await pool.close(); await context!.close().catch(() => {}); },
     };
   } catch (error) {
+    await plus?.close().catch(() => {});
+    await pro?.close().catch(() => {});
     if (context) await context.close().catch(() => {});
     if (error instanceof ChatShareBrowserError) throw error;
     throw new ChatShareBrowserError("launch_failed", "Could not prepare the Plus and Pro ChatShare channels.");
