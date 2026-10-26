@@ -133,14 +133,17 @@ export CHATSHARE_HOME="$HOME/.codex-chatshare-test"
 | `port` | `3211`，只监听本机 |
 | `chromeExecutablePath` | 可选；Chrome 可执行文件的绝对路径 |
 | `turnTimeoutMs` | `180000`，单次文本请求超时 |
+| `seatSetupTimeoutMs` | `120000`，点击席位后，导航、个人资料与输入框就绪、GPT-6 配置共用的超时；范围为 `1000`–`600000` 毫秒 |
 | `pollIntervalMs` | `250`，页面观察间隔 |
 | `stableIntervalMs` | `1500`，回答文本稳定观察间隔 |
 | `maxPromptChars` | `24000`，完整传输提示词的字符上限，包含上下文、JSON 编码和封装说明；不是模型 token 上下文承诺 |
 | `seatPollIntervalMs` | `5000`，席位满员时的容量轮询间隔 |
-| `seatWaitTimeoutMs` | `0` 表示持续等待；可设为正数限制单次席位准备等待 |
+| `seatWaitTimeoutMs` | `0` 表示持续等待；可设为正数限制等待席位按钮可用的时间 |
 | `heartbeatIntervalMs` | `240000`，前台滚动保活间隔 |
 | `heartbeatIdleLimitMs` | `600000`，无业务需求后停止保活的时长 |
 | `selectors` | 可覆写 `composer`、`sendButton`、`stopButton`、`userMessage`、`assistantMessage`、`assistantContent`、`errorMessage` |
+
+旧配置未填写 `seatSetupTimeoutMs` 时会自动使用两分钟默认值；隔离 profile 加载较慢时，可在允许范围内增大此值。等待席位容量由 `seatWaitTimeoutMs` 控制，文本请求由 `turnTimeoutMs` 控制。Plus 完成准备后才开始准备 Pro；准备超时不会发送提示词，频道保持不可用，GPT-6 仍是硬性要求。
 
 选择器应依据正常登录后实际观察到的页面调整。文本暂时稳定并不能独自证明生成已经完成；扩大超时或缩短稳定间隔也不能修复错误的页面绑定。不要猜测席位地址，不要将包含一次性登录令牌的完整跳转 URL 发到公开 issue。
 

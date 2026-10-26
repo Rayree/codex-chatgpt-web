@@ -7,6 +7,7 @@ import { isAbsolute, join, resolve } from "node:path";
 export const CHATSHARE_MODEL_ID = "chatshare-web-text";
 export const CHATSHARE_ENTRY_URL = "https://chatshare.tv/";
 export const CHATSHARE_CHAT_URL = "https://chat.chatshare.tv/";
+export const DEFAULT_CHATSHARE_SEAT_SETUP_TIMEOUT_MS = 120000;
 
 export interface ChatShareSelectors {
   composer: string;
@@ -29,8 +30,10 @@ export interface ChatShareConfig {
   maxPromptChars: number;
   /** How often a full seat page is checked while capacity is unavailable. */
   seatPollIntervalMs?: number;
-  /** Optional bounded wait used by tests or operators; zero means keep waiting. */
+  /** Maximum wait for a seat button; zero means keep waiting for capacity. */
   seatWaitTimeoutMs?: number;
+  /** Deadline after selecting a seat for navigation, profile and model setup. */
+  seatSetupTimeoutMs?: number;
   /** Foreground scroll interval used for idle seat renewal. */
   heartbeatIntervalMs?: number;
   /** Stop renewing a channel after this much demand-free time. */
@@ -71,7 +74,7 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
     throw new Error("ChatShare config must be a JSON object.");
   }
   const input = raw as Record<string, unknown>;
-  const allowed = new Set(["version", "port", "token", "chromeExecutablePath", "turnTimeoutMs", "pollIntervalMs", "stableIntervalMs", "maxPromptChars", "seatPollIntervalMs", "seatWaitTimeoutMs", "heartbeatIntervalMs", "heartbeatIdleLimitMs", "selectors"]);
+  const allowed = new Set(["version", "port", "token", "chromeExecutablePath", "turnTimeoutMs", "pollIntervalMs", "stableIntervalMs", "maxPromptChars", "seatPollIntervalMs", "seatWaitTimeoutMs", "seatSetupTimeoutMs", "heartbeatIntervalMs", "heartbeatIdleLimitMs", "selectors"]);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new Error(`ChatShare config: unknown field ${key}.`);
   }
@@ -102,6 +105,7 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
   const stableIntervalMs = integerSetting(input.stableIntervalMs, 1500, "stableIntervalMs", 500, 10000);
   const seatPollIntervalMs = integerSetting(input.seatPollIntervalMs, 5000, "seatPollIntervalMs", 250, 60000);
   const seatWaitTimeoutMs = integerSetting(input.seatWaitTimeoutMs, 0, "seatWaitTimeoutMs", 0, 86400000);
+  const seatSetupTimeoutMs = integerSetting(input.seatSetupTimeoutMs, DEFAULT_CHATSHARE_SEAT_SETUP_TIMEOUT_MS, "seatSetupTimeoutMs", 1000, 600000);
   const heartbeatIntervalMs = integerSetting(input.heartbeatIntervalMs, 240000, "heartbeatIntervalMs", 1000, 3600000);
   const heartbeatIdleLimitMs = integerSetting(input.heartbeatIdleLimitMs, 600000, "heartbeatIdleLimitMs", 1000, 86400000);
   return {
@@ -114,6 +118,7 @@ export function parseChatShareConfig(raw: unknown, profileDir: string): ChatShar
     stableIntervalMs,
     seatPollIntervalMs,
     seatWaitTimeoutMs,
+    seatSetupTimeoutMs,
     heartbeatIntervalMs,
     heartbeatIdleLimitMs,
     maxPromptChars: integerSetting(input.maxPromptChars, 24000, "maxPromptChars", 1000, 100000),

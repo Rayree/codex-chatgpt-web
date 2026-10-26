@@ -129,10 +129,13 @@ These fields can be adjusted in the existing `config.json`. Preserve the generat
 | `port` | `3211`, listening on loopback only |
 | `chromeExecutablePath` | Optional absolute path to the Chrome executable |
 | `turnTimeoutMs` | `180000`, the deadline for a text request |
+| `seatSetupTimeoutMs` | `120000`, the shared deadline after selecting a seat for navigation, profile/composer readiness, and GPT-6 setup; accepts `1000`–`600000` milliseconds |
 | `pollIntervalMs` | `250`, the page observation interval |
 | `stableIntervalMs` | `1500`, the answer-text stability interval |
 | `maxPromptChars` | `24000`, counting the complete transport prompt, including history, JSON encoding, and wrapper instructions; not a model token-context guarantee |
 | `selectors` | Overrides for `composer`, `sendButton`, `stopButton`, `userMessage`, `assistantMessage`, `assistantContent`, and `errorMessage` |
+
+Existing configuration files automatically use the two-minute seat-setup default when `seatSetupTimeoutMs` is absent. Increase it within the allowed range if the isolated profile loads slowly. Capacity waiting is controlled separately by `seatWaitTimeoutMs`, and text requests use `turnTimeoutMs`. Plus must finish setup before Pro starts preparing; a setup timeout leaves the channel unavailable and sends no prompt. GPT-6 remains mandatory.
 
 Derive selector changes from the page reached through normal sign-in. Stable text alone does not prove generation has finished; changing timing settings does not repair an incorrect page binding. Do not guess seat URLs, and do not post complete redirect URLs containing one-time login tokens in public issues.
 

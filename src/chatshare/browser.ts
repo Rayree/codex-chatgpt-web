@@ -3,6 +3,7 @@ import { chromium, type BrowserContext, type Locator, type Page } from "playwrig
 import {
   CHATSHARE_CHAT_URL,
   CHATSHARE_ENTRY_URL,
+  DEFAULT_CHATSHARE_SEAT_SETUP_TIMEOUT_MS,
   findChromeExecutable,
   type ChatShareConfig,
   type ChatShareSelectors,
@@ -501,6 +502,12 @@ export async function createChatShareBrowserController(
   };
 
   const configureModel = async (seat: ChatShareSeat, deadline: number): Promise<void> => {
+    const setupActionTimeout = (): number => {
+      ensurePage(true);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new ChatShareBrowserError("seat_setup_timeout", "ChatShare seat setup exceeded seatSetupTimeoutMs. No prompt was submitted.");
+      return Math.min(5000, remaining);
+    };
     const profileLoading = page.getByText(/^(?:正在加载个人资料|Loading (?:your )?profile)[.\u2026]*$/iu).first();
     const profileReady = async (): Promise<boolean> => {
       if (await profileLoading.isVisible()) return false;
@@ -510,9 +517,9 @@ export async function createChatShareBrowserController(
     // A visible picker alone does not mean profile/menu data has hydrated.
     const picker = await waitForModelControl(
       async () => await profileReady() ? firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]') : undefined, deadline,
-      new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker did not become ready before the timeout. No prompt was submitted."),
+      new ChatShareBrowserError("model_picker_missing", "The ChatShare profile, composer, or model picker did not become ready within seatSetupTimeoutMs. No prompt was submitted."),
     );
-    await picker.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+    await picker.click({ noWaitAfter: true, timeout: setupActionTimeout() });
     let reopenAfter = Date.now() + 1000;
     let refreshAfter = Date.now() + 3000;
     const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
@@ -538,21 +545,22 @@ export async function createChatShareBrowserController(
         else await currentPicker.click({ noWaitAfter: true, timeout: Math.min(1000, remaining) });
         return undefined;
       }, deadline,
-      new ChatShareBrowserError("model_unavailable", "GPT-6 did not become ready in the selected ChatShare seat before the timeout; the bridge will not switch to GPT-5.6 Sol."),
+      new ChatShareBrowserError("model_unavailable", "GPT-6 did not become ready in the selected ChatShare seat within seatSetupTimeoutMs; the bridge will not switch to GPT-5.6 Sol."),
     );
-    await model.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+    await model.click({ noWaitAfter: true, timeout: setupActionTimeout() });
     // Pro supports Extra High (data-selected-reasoning-effort="max"). Plus
     // exposes Instant/none and must be reported as a downgrade.
     let effort = seat === "pro"
       ? page.getByRole("menuitem", { name: /Extra High|最高|Max/iu }).first()
       : page.getByRole("menuitem", { name: /即时|Instant/iu }).first();
     if (!await effort.isVisible().catch(() => false)) {
-      await picker.click({ noWaitAfter: true }).catch(() => {});
+      await picker.click({ noWaitAfter: true, timeout: setupActionTimeout() }).catch(() => {});
       effort = seat === "pro"
         ? page.getByRole("menuitem", { name: /Extra High|最高|Max/iu }).first()
         : page.getByRole("menuitem", { name: /即时|Instant/iu }).first();
     }
-    if (await effort.isVisible().catch(() => false)) await effort.click({ noWaitAfter: true });
+    if (await effort.isVisible().catch(() => false)) await effort.click({ noWaitAfter: true, timeout: setupActionTimeout() });
+    setupActionTimeout();
     selectedSeat = seat;
     actualModel = "GPT-6";
     reasoningEffort = seat === "pro" ? "max" : "none";
@@ -588,7 +596,7 @@ export async function createChatShareBrowserController(
       await delay(config.seatPollIntervalMs ?? 5000, lifecycleAbort.signal);
       await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
     }
-    const chatDeadline = Date.now() + Math.min(config.turnTimeoutMs, 30000);
+    const chatDeadline = Date.now() + (config.seatSetupTimeoutMs ?? DEFAULT_CHATSHARE_SEAT_SETUP_TIMEOUT_MS);
     while (!isChatShareUrl(page.url(), true)) {
       ensurePage();
       if (Date.now() >= chatDeadline) throw new ChatShareBrowserError("seat_navigation_timeout", `The ${seat} seat did not open its chat page.`, "none");

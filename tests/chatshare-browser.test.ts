@@ -267,7 +267,8 @@ test.each(["before-send", "before-poll", "delayed-ack", "after-poll", "no-ack", 
   },
 );
 
-async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra", turnTimeoutMs = 10000) {
+async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra", seatSetupTimeoutMs = 10000,
+  overrides: Partial<Pick<ChatShareConfig, "turnTimeoutMs" | "seatSetupTimeoutMs">> = {}) {
   let url = CHATSHARE_ENTRY_URL;
   let pickerSeen!: () => void;
   let modelSeen!: () => void;
@@ -340,8 +341,9 @@ async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra
   const context = { on() {}, route: async () => {} } as unknown as BrowserContext;
   const controller = await createChatShareBrowserController({
     port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
-    turnTimeoutMs, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
+    turnTimeoutMs: 10000, seatSetupTimeoutMs, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
     selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
+    ...overrides,
   }, context, { page, ownsContext: false, initialOpen: false, seat });
   return { controller, page, ready, menu, clicks, pickerChecked, modelChecked, pickerReopened, loadingChecked, composerChecked, menuClosed };
 }
@@ -470,6 +472,64 @@ test("seat entry waits for profile loading and an editable composer before openi
   } finally { await fixture.controller.close(); await outcome; }
 });
 
+test.each(["default", "configured"] as const)("seat setup can finish after the request timeout and thirty seconds (%s budget)", async budget => {
+  const clock = spyOn(Date, "now").mockReturnValue(0);
+  const fixture = await seatEntryFixture("plus", "GPT-6", 10000, {
+    turnTimeoutMs: 10000, seatSetupTimeoutMs: budget === "default" ? undefined : 90000,
+  });
+  fixture.ready.profileLoading = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.loadingChecked;
+    expect((await fixture.controller.status()).state).toBe("entry");
+    clock.mockReturnValue(45000);
+    fixture.ready.profileLoading = false;
+    fixture.ready.picker = true;
+    fixture.ready.model = true;
+    expect(await outcome).toBe(undefined);
+    expect(fixture.clicks).toEqual(["plus", "picker", "GPT-6", "none"]);
+    expect(await fixture.controller.status()).toMatchObject({ state: "ready", actualModel: "GPT-6", healthy: true });
+  } finally { clock.mockRestore(); await fixture.controller.close(); await outcome; }
+});
+
+test("seat setup shares one configured deadline across profile and GPT-6 readiness", async () => {
+  const clock = spyOn(Date, "now").mockReturnValue(0);
+  const fixture = await seatEntryFixture("plus", "GPT-5.6 Sol", 60000);
+  fixture.ready.profileLoading = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.loadingChecked;
+    clock.mockReturnValue(45000);
+    fixture.ready.profileLoading = false;
+    fixture.ready.picker = true;
+    fixture.ready.model = true;
+    await fixture.modelChecked;
+    clock.mockReturnValue(60001);
+    expect(await outcome).toMatchObject({ code: "model_unavailable", submission: "none" });
+    expect(fixture.clicks).toEqual(["plus", "picker"]);
+    expect(await fixture.controller.status()).toMatchObject({ state: "entry", healthy: false });
+    expect((await fixture.controller.status()).actualModel).toBe(undefined);
+  } finally { clock.mockRestore(); await fixture.controller.close(); await outcome; }
+});
+
+test.each(["deadline", "shutdown"] as const)("the longer default seat setup wait respects %s", async reason => {
+  const clock = spyOn(Date, "now").mockReturnValue(0);
+  const fixture = await seatEntryFixture("plus", "GPT-6", 10000, { seatSetupTimeoutMs: undefined });
+  fixture.ready.profileLoading = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.loadingChecked;
+    clock.mockReturnValue(reason === "deadline" ? 120001 : 45000);
+    if (reason === "shutdown") await fixture.controller.close();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(ChatShareBrowserError);
+    if (reason === "deadline") expect(error).toMatchObject({ code: "model_picker_missing", submission: "none" });
+    else expect(["cancelled", "browser_closed"]).toContain(error.code);
+    expect(fixture.clicks).toEqual(["plus"]);
+    expect((await fixture.controller.status()).actualModel).toBe(undefined);
+  } finally { clock.mockRestore(); await fixture.controller.close(); await outcome; }
+});
+
 test("seat entry refreshes an open stale menu and still selects only GPT-6", async () => {
   const fixture = await seatEntryFixture("plus", "GPT-6");
   fixture.ready.picker = true;
@@ -557,6 +617,7 @@ test.each(["ready", "failed"] as const)("channel startup gates Pro page creation
   const outcome = openChatShareChannelPool({
     port: 3211, token: "offline-test-key", chromeExecutablePath: executablePath, profileDir,
     turnTimeoutMs: 1000, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
+    seatSetupTimeoutMs: 1000,
     selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
   }).then(value => { pool = value; return undefined; }, error => error);
   try {
@@ -792,6 +853,7 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
     const controller = await createChatShareBrowserController({
       port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
       turnTimeoutMs: menuState === "stale" ? 8000 : 3000, pollIntervalMs: 20, stableIntervalMs: 50, maxPromptChars: 24000,
+      seatSetupTimeoutMs: menuState === "stale" ? 8000 : 3000,
       // Fail a missing seat label before the test harness timeout.
       seatWaitTimeoutMs: 3000, seatPollIntervalMs: 20,
       selectors: { ...DEFAULT_CHATSHARE_SELECTORS },

@@ -26,6 +26,8 @@ test("init creates isolated owner-only configuration and preserves its key on re
   expect(first.config.token).toHaveLength(43);
   expect(first.config.token).toBe(second.config.token);
   expect(first.config.profileDir).toBe(join(root, "private/browser"));
+  expect(first.config.seatSetupTimeoutMs).toBe(120000);
+  expect(second.config.seatSetupTimeoutMs).toBe(120000);
   expect((JSON.parse(await readFile(first.configFile, "utf8")) as { token: string }).token).toBe(first.config.token);
   if (process.platform !== "win32") {
     expect((await stat(first.configFile)).mode & 0o777).toBe(0o600);
@@ -47,6 +49,22 @@ test("configuration validation rejects unsafe and unsupported settings", () => {
   expect(prepared.seatPollIntervalMs).toBe(5000);
   expect(prepared.heartbeatIntervalMs).toBe(240000);
   expect(prepared.heartbeatIdleLimitMs).toBe(600000);
+});
+
+test("seat setup has an independent configurable and finite timeout", () => {
+  const valid = { version: 1, token: "a".repeat(43) };
+  const defaults = parseChatShareConfig(valid, "/profile");
+  expect(defaults.seatSetupTimeoutMs).toBe(120000);
+  expect(defaults.turnTimeoutMs).toBe(180000);
+  const configured = parseChatShareConfig({ ...valid, seatSetupTimeoutMs: 240000, turnTimeoutMs: 10000 }, "/profile");
+  expect(configured.seatSetupTimeoutMs).toBe(240000);
+  expect(configured.turnTimeoutMs).toBe(10000);
+  for (const seatSetupTimeoutMs of [1000, 600000]) {
+    expect(parseChatShareConfig({ ...valid, seatSetupTimeoutMs }, "/profile").seatSetupTimeoutMs).toBe(seatSetupTimeoutMs);
+  }
+  for (const seatSetupTimeoutMs of [0, -1, 999, 600001, 1000.5, Infinity, NaN, "120000", null]) {
+    expect(() => parseChatShareConfig({ ...valid, seatSetupTimeoutMs }, "/profile")).toThrow("seatSetupTimeoutMs");
+  }
 });
 
 test("load rejects broadly readable key files and reports missing configuration clearly", async () => {
