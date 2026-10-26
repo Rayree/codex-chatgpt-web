@@ -189,19 +189,27 @@ test.each(["before", "after"] as const)("a browser action timeout %s a send atte
   }
 });
 
-async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra") {
+async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra", turnTimeoutMs = 10000) {
   let url = CHATSHARE_ENTRY_URL;
   let pickerSeen!: () => void;
   let modelSeen!: () => void;
   const pickerChecked = new Promise<void>(resolve => { pickerSeen = resolve; });
   const modelChecked = new Promise<void>(resolve => { modelSeen = resolve; });
+  let reopened!: () => void;
+  const pickerReopened = new Promise<void>(resolve => { reopened = resolve; });
   const ready = { picker: false, model: false };
+  const menu = { visible: false, modelReadyOnOpen: false };
   const clicks: string[] = [];
   const one = (target: unknown) => ({ count: async () => 1, nth: () => target });
   const picker = {
     isVisible: async () => ready.picker,
     isEnabled: async () => true,
-    click: async () => { clicks.push("picker"); },
+    click: async () => {
+      clicks.push("picker");
+      menu.visible = !menu.visible;
+      if (menu.visible && menu.modelReadyOnOpen) ready.model = true;
+      if (clicks.filter(click => click === "picker").length === 2) reopened();
+    },
   };
   const page = {
     url: () => url,
@@ -219,11 +227,12 @@ async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra
         count: async () => { pickerSeen(); return ready.picker ? 1 : 0; },
         nth: () => picker,
       };
+      if (selector === '[role="menu"], [role="menuitemradio"]') return one({ isVisible: async () => menu.visible });
       throw new Error(`Unexpected locator: ${selector}`);
     },
     getByRole: (role: string, { name }: { name: RegExp }) => ({ first: () => {
       if (role === "menuitemradio") return {
-        isVisible: async () => { modelSeen(); return ready.model && name.test(offeredModel); },
+        isVisible: async () => { modelSeen(); return menu.visible && ready.model && name.test(offeredModel); },
         isEnabled: async () => true,
         click: async () => { clicks.push(offeredModel); },
       };
@@ -237,10 +246,10 @@ async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra
   const context = { on() {}, route: async () => {} } as unknown as BrowserContext;
   const controller = await createChatShareBrowserController({
     port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
-    turnTimeoutMs: 10000, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
+    turnTimeoutMs, pollIntervalMs: 1, stableIntervalMs: 0, maxPromptChars: 24000,
     selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
   }, context, { page, ownsContext: false, initialOpen: false, seat });
-  return { controller, ready, clicks, pickerChecked, modelChecked };
+  return { controller, ready, menu, clicks, pickerChecked, modelChecked, pickerReopened };
 }
 
 test.each(["plus", "pro"] as const)("seat entry waits for the delayed %s picker and GPT-6 menu before becoming ready", async seat => {
@@ -272,6 +281,80 @@ test.each(["plus", "pro"] as const)("seat entry waits for the delayed %s picker 
     await fixture.controller.close();
     await outcome;
   }
+});
+
+test.each(["plus", "pro"] as const)("seat entry reopens the %s menu closed by profile loading and selects only GPT-6", async seat => {
+  const fixture = await seatEntryFixture(seat, "GPT-6", 3000);
+  fixture.ready.picker = true;
+  const outcome = fixture.controller.openSeat(seat).then(() => undefined, error => error);
+  try {
+    await fixture.modelChecked;
+    // Loading dismisses the first menu. Its data is available on the next open.
+    fixture.menu.visible = false;
+    fixture.menu.modelReadyOnOpen = true;
+    expect(await fixture.controller.status()).toMatchObject({ state: "entry", healthy: false });
+    expect(await outcome).toBe(undefined);
+    expect(fixture.clicks).toEqual([seat, "picker", "picker", "GPT-6", seat === "plus" ? "none" : "max"]);
+    expect(await fixture.controller.status()).toMatchObject({ state: "ready", seat, actualModel: "GPT-6", healthy: true });
+  } finally { await fixture.controller.close(); await outcome; }
+});
+
+test("seat entry leaves an open menu alone while its model options load", async () => {
+  const fixture = await seatEntryFixture("plus", "GPT-6", 3000);
+  fixture.ready.picker = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.modelChecked;
+    // Exceed the reopening interval: an open loading menu must not be toggled.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    expect(fixture.clicks).toEqual(["plus", "picker"]);
+    expect((await fixture.controller.status()).state).toBe("entry");
+    fixture.ready.model = true;
+    expect(await outcome).toBe(undefined);
+    expect(fixture.clicks).toEqual(["plus", "picker", "GPT-6", "none"]);
+  } finally { await fixture.controller.close(); await outcome; }
+});
+
+test("seat entry reopening preserves the original deadline and never selects another model", async () => {
+  const clock = spyOn(Date, "now").mockReturnValue(0);
+  const fixture = await seatEntryFixture("plus", "GPT-5.6 Sol", 1500);
+  fixture.ready.picker = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.modelChecked;
+    fixture.menu.visible = false;
+    fixture.menu.modelReadyOnOpen = true;
+    clock.mockReturnValue(1001);
+    await Promise.race([
+      fixture.pickerReopened,
+      outcome.then(() => { throw new Error("Setup ended before the menu reopened"); }),
+    ]);
+    clock.mockReturnValue(1501);
+    expect(await outcome).toMatchObject({ code: "model_unavailable", submission: "none" });
+    expect(fixture.clicks).toEqual(["plus", "picker", "picker"]);
+    expect(await fixture.controller.status()).toMatchObject({ state: "entry", healthy: false });
+    expect((await fixture.controller.status()).actualModel).toBe(undefined);
+  } finally { clock.mockRestore(); await fixture.controller.close(); await outcome; }
+});
+
+test("closing a channel after reopening its model menu stops setup without selecting a model", async () => {
+  const fixture = await seatEntryFixture("plus", "GPT-6", 3000);
+  fixture.ready.picker = true;
+  const outcome = fixture.controller.openSeat("plus").then(() => undefined, error => error);
+  try {
+    await fixture.modelChecked;
+    fixture.menu.visible = false;
+    await Promise.race([
+      fixture.pickerReopened,
+      outcome.then(() => { throw new Error("Setup ended before the menu reopened"); }),
+    ]);
+    await fixture.controller.close();
+    const error = await outcome;
+    expect(error).toBeInstanceOf(ChatShareBrowserError);
+    expect(["cancelled", "browser_closed"]).toContain(error.code);
+    expect(fixture.clicks).toEqual(["plus", "picker", "picker"]);
+    expect((await fixture.controller.status()).state).toBe("closed");
+  } finally { await fixture.controller.close(); await outcome; }
 });
 
 test.each(["picker", "model"] as const)("seat entry times out safely when the required %s never appears", async stage => {
@@ -391,7 +474,7 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
     expect(result.messages[2]!.complete).toBeFalse();
   });
 
-  test("production seat entry waits for profile loading and the GPT-6 menu", async () => {
+  test.each(["delayed", "rerendered"] as const)("production seat entry waits for profile loading and the GPT-6 menu (%s)", async menuState => {
     const context = await browser.newContext();
     await context.route("**/*", async route => {
       if (route.request().url() === CHATSHARE_ENTRY_URL) {
@@ -403,8 +486,8 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
           <p id="profile">正在加载个人资料</p>
           <section id="chat" hidden>
             <textarea id="prompt-textarea"></textarea>
-            <button id="picker" aria-label="选择 ChatGPT 模型">Choose a model</button>
-            <div id="menu" hidden>
+            <button id="picker" aria-label="选择 ChatGPT 模型" aria-expanded="false">Choose a model</button>
+            <div id="menu" role="menu" hidden>
               <button role="menuitemradio" aria-checked="false">GPT-5.6 Sol</button>
               <button role="menuitemradio" aria-checked="false">GPT-6 Astra</button>
               <button role="menuitem">Instant</button>
@@ -412,16 +495,34 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
           </section>
           <script>
             window.selectionClicks = [];
-            const picker = document.querySelector('#picker');
+            let picker = document.querySelector('#picker');
             const menu = document.querySelector('#menu');
+            let opens = 0;
             setTimeout(() => {
               document.querySelector('#profile').remove();
               document.querySelector('#chat').hidden = false;
             }, 100);
-            picker.addEventListener('click', () => {
+            const openMenu = () => {
               window.selectionClicks.push('picker');
-              setTimeout(() => { menu.hidden = false; }, 100);
-            });
+              picker.setAttribute('aria-expanded', 'true');
+              if (${menuState === "rerendered"} && ++opens === 1) {
+                const model = menu.querySelectorAll('[role="menuitemradio"]')[1];
+                model.hidden = true;
+                menu.hidden = false;
+                setTimeout(() => {
+                  menu.hidden = true;
+                  model.hidden = false;
+                  const replacement = picker.cloneNode(true);
+                  replacement.setAttribute('aria-expanded', 'false');
+                  picker.replaceWith(replacement);
+                  picker = replacement;
+                  picker.addEventListener('click', openMenu);
+                }, 100);
+              } else {
+                setTimeout(() => { menu.hidden = false; }, 100);
+              }
+            };
+            picker.addEventListener('click', openMenu);
             document.querySelectorAll('[role="menuitemradio"]').forEach(model => {
               model.addEventListener('click', () => {
                 window.selectionClicks.push(model.textContent);
@@ -432,6 +533,7 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
             document.querySelector('[role="menuitem"]').addEventListener('click', () => {
               window.selectionClicks.push('Instant');
               menu.hidden = true;
+              picker.setAttribute('aria-expanded', 'false');
             });
           </script>
         </body></html>` });
@@ -451,7 +553,9 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
       expect(await controller.status()).toMatchObject({ state: "ready", seat: "plus", actualModel: "GPT-6", healthy: true });
       expect(await context.pages()[0]!.evaluate(() =>
         (window as unknown as { selectionClicks: string[] }).selectionClicks,
-      )).toEqual(["picker", "GPT-6 Astra", "Instant"]);
+      )).toEqual(menuState === "rerendered"
+        ? ["picker", "picker", "GPT-6 Astra", "Instant"]
+        : ["picker", "GPT-6 Astra", "Instant"]);
       expect(await context.pages()[0]!.locator('#picker').textContent()).toBe("GPT-6 Astra");
     } finally { await controller.close(); }
   }, 15_000); // Allow context setup and cleanup beyond the seat/model deadlines.

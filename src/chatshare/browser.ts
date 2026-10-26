@@ -490,10 +490,25 @@ export async function createChatShareBrowserController(
       new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker did not become ready before the timeout. No prompt was submitted."),
     );
     await picker.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+    let reopenAfter = Date.now() + 1000;
     const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
     await waitForModelControl(
-      async () => await model.isVisible() ? model : undefined, deadline,
-      new ChatShareBrowserError("model_unavailable", "GPT-6 is not available in the selected ChatShare seat; the bridge will not switch to GPT-5.6 Sol."),
+      async () => {
+        if (await model.isVisible()) return model;
+        if (Date.now() < reopenAfter) return undefined;
+        // Profile loading can close or replace the menu after the first click.
+        // Leave an open menu alone while its options load; reopen a closed one.
+        if (await firstVisible(page, '[role="menu"], [role="menuitemradio"]')) return undefined;
+        const currentPicker = await firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]');
+        if (!currentPicker || !await currentPicker.isEnabled()) return undefined;
+        ensurePage(true);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return undefined;
+        reopenAfter = Date.now() + 1000;
+        await currentPicker.click({ noWaitAfter: true, timeout: Math.min(1000, remaining) });
+        return undefined;
+      }, deadline,
+      new ChatShareBrowserError("model_unavailable", "GPT-6 did not become ready in the selected ChatShare seat before the timeout; the bridge will not switch to GPT-5.6 Sol."),
     );
     await model.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
     // Pro supports Extra High (data-selected-reasoning-effort="max"). Plus
