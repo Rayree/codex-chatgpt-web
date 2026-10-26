@@ -1,3 +1,5 @@
+> **ChatShare experiment in this fork:** an isolated text bridge targeting macOS Apple Silicon. Read the [ChatShare guide](docs/chatshare.md). Local tools and images are not supported yet; a real Mac and an authenticated ChatShare seat still need verification. The upstream release downloads below do not include this experiment.
+
 <p align="center">
   <img src="assets/readme/hero.svg" width="960" alt="Switch to web models. Stay in Codex. Your ChatGPT plan. Your workflow. Maximum capabilities.">
 </p>
