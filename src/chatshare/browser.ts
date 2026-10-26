@@ -436,12 +436,29 @@ export async function createChatShareBrowserController(
     }
   };
   const stopOnce = async (prompt: string, tracker: ChatShareTurnTracker): Promise<void> => {
-    if (closed || page.isClosed() || !isChatShareUrl(page.url(), true)) return;
+    const stopDeadline = Date.now() + 1500;
     try {
-      const users = (await snapshot()).messages.filter(message => message.role === "user");
-      if (users.length !== 1 || !chatSharePromptMatches(users[0]!, prompt) || !tracker.userAcknowledged) return;
-      const button = await firstVisible(page, config.selectors.stopButton);
-      if (button) await button.click({ timeout: 1500, noWaitAfter: true });
+      while (Date.now() < stopDeadline) {
+        if (closed || page.isClosed() || !isChatShareUrl(page.url(), true)) return;
+        const state = await snapshot();
+        const users = state.messages.filter(message => message.role === "user");
+        if (users.length > 1 || (users[0] && !chatSharePromptMatches(users[0], prompt))) return;
+        // Abort may beat the first response poll. Establish ownership from a
+        // fresh snapshot rather than requiring a previously cached acknowledgement.
+        tracker.observe(state, Date.now());
+        const button = tracker.userAcknowledged && users.length === 1
+          ? await firstVisible(page, config.selectors.stopButton) : undefined;
+        const remaining = stopDeadline - Date.now();
+        if (remaining <= 0 || closed || page.isClosed()) return;
+        if (button) {
+          // The click itself is never retried, even if its acknowledgement fails.
+          await button.click({ timeout: remaining, noWaitAfter: true });
+          return;
+        }
+        // The request is already aborted; only controller shutdown cancels this
+        // bounded wait for the submitted turn and its Stop control to render.
+        await delay(Math.min(config.pollIntervalMs ?? 250, remaining), lifecycleAbort.signal);
+      }
     } catch { /* Cancellation cannot safely retry or turn into another submission. */ }
   };
   const openEntry = async (allowBusy = false): Promise<void> => {
@@ -754,7 +771,7 @@ export async function createChatShareBrowserController(
         // A click followed by a timeout/502/seat error is intentionally left
         // running: the page may have accepted it. Only an explicit client
         // cancellation after a matched user turn may use Stop.
-        if (signal?.aborted && attemptedSubmission && tracker?.userAcknowledged) await stopOnce(prompt, tracker);
+        if (signal?.aborted && attemptedSubmission && tracker) await stopOnce(prompt, tracker);
         if (signal?.aborted) throw new ChatShareBrowserError("cancelled", "ChatShare request cancelled. It will not be resent; inspect the page before retrying.", attemptedSubmission ? "unknown" : "none");
         if (error instanceof ChatShareBrowserError) {
           if (attemptedSubmission && error.submission === "none") {

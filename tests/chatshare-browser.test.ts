@@ -193,6 +193,80 @@ test.each(["before", "after"] as const)("a browser action timeout %s a send atte
   }
 });
 
+test.each(["before-send", "before-poll", "delayed-ack", "after-poll", "no-ack", "foreign", "ambiguous", "stop-error"] as const)(
+  "cancellation verifies the submitted turn and attempts Stop at most once (%s)", async phase => {
+    const abort = new AbortController();
+    const events: string[] = [];
+    const deltas: string[] = [];
+    let draft = "";
+    let submitted = false;
+    let postSendReads = 0;
+    let proCalls = 0;
+    const composer = {
+      isVisible: async () => true,
+      fill: async (text: string) => { draft = text; if (phase === "before-send") abort.abort(); },
+    };
+    const send = {
+      isVisible: async () => true, isEnabled: async () => true,
+      click: async () => {
+        submitted = true;
+        events.push("send");
+        if (phase !== "after-poll") abort.abort();
+      },
+    };
+    const stop = {
+      isVisible: async () => submitted,
+      click: async () => {
+        events.push("stop");
+        if (phase === "stop-error") throw new Error("Stop click acknowledgement failed");
+      },
+    };
+    const page = {
+      url: () => CHATSHARE_CHAT_URL, isClosed: () => false, setDefaultTimeout() {},
+      goto: async () => { draft = ""; submitted = false; },
+      evaluate: async () => {
+        if (!submitted) return snapshot([], { composerText: draft });
+        postSendReads++;
+        if (phase === "after-poll" && postSendReads === 1) abort.abort();
+        if (phase === "no-ack" || (phase === "delayed-ack" && postSendReads === 1)) {
+          return snapshot([], { stopVisible: true });
+        }
+        const users = [message("user", "new-user", 0, phase === "foreign" ? "Someone else's prompt" : "Only send once")];
+        if (phase === "ambiguous") users.push(message("user", "other-user", 1, "Another turn"));
+        return snapshot(users, { stopVisible: true });
+      },
+      locator: (selector: string) => {
+        const target = selector === DEFAULT_CHATSHARE_SELECTORS.composer ? composer
+          : selector === DEFAULT_CHATSHARE_SELECTORS.sendButton ? send
+          : selector === DEFAULT_CHATSHARE_SELECTORS.stopButton ? stop : undefined;
+        return { count: async () => target ? 1 : 0, nth: () => target };
+      },
+    } as unknown as Page;
+    const context = { on() {}, route: async () => {} } as unknown as BrowserContext;
+    const controller = await createChatShareBrowserController({
+      port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
+      turnTimeoutMs: 3000, pollIntervalMs: 5, stableIntervalMs: 0, maxPromptChars: 24000,
+      selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
+    }, context, { page, ownsContext: false, initialOpen: false, seat: "plus" });
+    const pool = new ChatShareChannelPool({
+      plus: controller,
+      pro: {
+        status: async () => ({ state: "ready", url: CHATSHARE_CHAT_URL, message: "ready", seat: "pro" }),
+        runText: async () => { proCalls++; return "Must not resend"; },
+        close: async () => {},
+      },
+    });
+    try {
+      await expect(pool.runText("Only send once", { signal: abort.signal, onTextDelta: text => deltas.push(text) }))
+        .rejects.toMatchObject({ code: "cancelled", submission: phase === "before-send" ? "none" : "unknown" });
+      const canStop = ["before-poll", "delayed-ack", "after-poll", "stop-error"].includes(phase);
+      expect(events).toEqual(phase === "before-send" ? [] : canStop ? ["send", "stop"] : ["send"]);
+      expect(proCalls).toBe(0);
+      expect(deltas).toEqual([]);
+    } finally { await pool.close(); }
+  },
+);
+
 async function seatEntryFixture(seat: ChatShareSeat, offeredModel = "GPT-6 Astra", turnTimeoutMs = 10000) {
   let url = CHATSHARE_ENTRY_URL;
   let pickerSeen!: () => void;
@@ -558,13 +632,14 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
   let browser: Browser;
   let page: Page;
   // Cold Chrome startup can exceed Bun's default five-second hook timeout.
-  beforeAll(async () => {
+  beforeAll(async function launchOfflineChromium() {
     browser = await chromium.launch({ executablePath: chrome, headless: true });
     const context = await browser.newContext();
     await context.route("**/*", route => route.abort());
     page = await context.newPage();
   }, 60_000);
-  afterAll(async () => { await browser?.close(); });
+  // Browser teardown has its own budget; a test's timeout does not cover hooks.
+  afterAll(async function closeOfflineChromium() { await browser?.close(); }, 60_000);
   const read = async (html: string) => {
     await page.setContent(html);
     return page.evaluate(readChatShareDom, { selectors: {
