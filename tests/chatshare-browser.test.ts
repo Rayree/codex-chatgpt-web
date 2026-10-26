@@ -395,11 +395,11 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
     const context = await browser.newContext();
     await context.route("**/*", async route => {
       if (route.request().url() === CHATSHARE_ENTRY_URL) {
-        await route.fulfill({ contentType: "text/html", body: `<!doctype html><html><body>
+        await route.fulfill({ contentType: "text/html; charset=utf-8", body: `<!doctype html><html><body>
           <button onclick="location.href='${CHATSHARE_CHAT_URL}'">进入 Plus</button>
         </body></html>` });
       } else if (route.request().url() === CHATSHARE_CHAT_URL) {
-        await route.fulfill({ contentType: "text/html", body: `<!doctype html><html><body>
+        await route.fulfill({ contentType: "text/html; charset=utf-8", body: `<!doctype html><html><body>
           <p id="profile">正在加载个人资料</p>
           <section id="chat" hidden>
             <textarea id="prompt-textarea"></textarea>
@@ -442,6 +442,8 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
     const controller = await createChatShareBrowserController({
       port: 3211, token: "offline-test-key", profileDir: "/unused-offline-fixture",
       turnTimeoutMs: 3000, pollIntervalMs: 20, stableIntervalMs: 50, maxPromptChars: 24000,
+      // Fail a missing seat label before the test harness timeout.
+      seatWaitTimeoutMs: 3000, seatPollIntervalMs: 20,
       selectors: { ...DEFAULT_CHATSHARE_SELECTORS },
     }, context);
     try {
@@ -452,7 +454,7 @@ describe.skipIf(!chrome)("ChatShare DOM fixtures in Chromium", () => {
       )).toEqual(["picker", "GPT-6 Astra", "Instant"]);
       expect(await context.pages()[0]!.locator('#picker').textContent()).toBe("GPT-6 Astra");
     } finally { await controller.close(); }
-  });
+  }, 15_000); // Allow context setup and cleanup beyond the seat/model deadlines.
 
   const offlineChat = `<!doctype html><html><body>
     <main id="messages"></main><textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button>
