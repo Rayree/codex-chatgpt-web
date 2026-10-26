@@ -385,6 +385,7 @@ export async function createChatShareBrowserController(
 ): Promise<ChatShareSeatBrowser> {
   let closed = false;
   let busy = false;
+  let seatSetupIncomplete = false;
   let page: Page;
   let selectedSeat: ChatShareSeat | undefined = options.seat;
   let actualModel: "GPT-6" | undefined;
@@ -465,15 +466,36 @@ export async function createChatShareBrowserController(
     return undefined;
   };
 
-  const configureModel = async (seat: ChatShareSeat): Promise<void> => {
-    const picker = await firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]');
-    if (!picker) throw new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker was not found. Select GPT-6 manually and retry.");
-    await picker.click({ noWaitAfter: true });
-    const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
-    if (!await model.isVisible().catch(() => false)) {
-      throw new ChatShareBrowserError("model_unavailable", "GPT-6 is not available in the selected ChatShare seat; the bridge will not switch to GPT-5.6 Sol.");
+  const waitForModelControl = async (
+    find: () => Promise<Locator | undefined>, deadline: number, failure: ChatShareBrowserError,
+  ): Promise<Locator> => {
+    while (Date.now() < deadline) {
+      ensurePage(true);
+      const control = await find().catch(() => undefined);
+      const enabled = control && await control.isEnabled().catch(() => false);
+      ensurePage(true);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      if (control && enabled) return control;
+      await delay(Math.min(config.pollIntervalMs ?? 250, remaining), lifecycleAbort.signal);
     }
-    await model.click({ noWaitAfter: true });
+    ensurePage(true);
+    throw failure;
+  };
+
+  const configureModel = async (seat: ChatShareSeat, deadline: number): Promise<void> => {
+    // The chat URL can arrive before profile loading renders the controls.
+    const picker = await waitForModelControl(
+      () => firstVisible(page, 'button[aria-label="选择 ChatGPT 模型"]'), deadline,
+      new ChatShareBrowserError("model_picker_missing", "The ChatShare model picker did not become ready before the timeout. No prompt was submitted."),
+    );
+    await picker.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
+    const model = page.getByRole("menuitemradio", { name: /^GPT-6(?:\s|$)/u }).first();
+    await waitForModelControl(
+      async () => await model.isVisible() ? model : undefined, deadline,
+      new ChatShareBrowserError("model_unavailable", "GPT-6 is not available in the selected ChatShare seat; the bridge will not switch to GPT-5.6 Sol."),
+    );
+    await model.click({ noWaitAfter: true, timeout: Math.max(1, Math.min(5000, deadline - Date.now())) });
     // Pro supports Extra High (data-selected-reasoning-effort="max"). Plus
     // exposes Instant/none and must be reported as a downgrade.
     let effort = seat === "pro"
@@ -494,6 +516,11 @@ export async function createChatShareBrowserController(
   const openSeat = async (seat: ChatShareSeat, recovering = false): Promise<void> => {
     if (closed || page.isClosed()) throw new ChatShareBrowserError("browser_closed", "The ChatShare browser is closed. Restart the bridge.");
     if (busy && !recovering) throw new ChatShareBrowserError("busy", "Wait for the active request before changing the ChatShare seat.");
+    // Keep background channels out of the pool until setup succeeds, including
+    // after a failed setup. An editable composer alone does not verify a model.
+    seatSetupIncomplete = true;
+    actualModel = undefined;
+    reasoningEffort = undefined;
     await openEntry(recovering);
     const deadline = config.seatWaitTimeoutMs
       ? Date.now() + config.seatWaitTimeoutMs
@@ -518,14 +545,17 @@ export async function createChatShareBrowserController(
     }
     const chatDeadline = Date.now() + Math.min(config.turnTimeoutMs, 30000);
     while (!isChatShareUrl(page.url(), true)) {
+      ensurePage();
       if (Date.now() >= chatDeadline) throw new ChatShareBrowserError("seat_navigation_timeout", `The ${seat} seat did not open its chat page.`, "none");
-      await delay(config.pollIntervalMs ?? 250);
+      await delay(Math.min(config.pollIntervalMs ?? 250, chatDeadline - Date.now()), lifecycleAbort.signal);
     }
-    await configureModel(seat);
+    await configureModel(seat, chatDeadline);
+    ensurePage(true);
+    seatSetupIncomplete = false;
   };
 
   heartbeatTimer = setInterval(() => {
-    if (closed || busy || !selectedSeat || Date.now() - lastDemandAt >= heartbeatIdleLimitMs) return;
+    if (closed || busy || seatSetupIncomplete || !selectedSeat || Date.now() - lastDemandAt >= heartbeatIdleLimitMs) return;
     if (!isChatShareUrl(page.url(), true)) return;
     // A real foreground scroll is the platform's documented renewal gesture. It
     // never touches the composer and never submits a message.
@@ -540,6 +570,7 @@ export async function createChatShareBrowserController(
       const details = { seat: selectedSeat, actualModel, reasoningEffort, healthy: false } as const;
       if (closed || page.isClosed()) return { state: "closed", url, message: "The isolated ChatShare browser is closed.", ...details };
       if (busy) return { state: "busy", url, message: "A ChatShare request is in progress.", ...details };
+      if (seatSetupIncomplete) return { state: "entry", url, message: "ChatShare seat and GPT-6 model setup has not completed.", ...details };
       if (!isChatShareUrl(page.url())) return { state: "unavailable", url, message: "Open the ChatShare entry page again.", ...details };
       if (!isChatShareUrl(page.url(), true)) return { state: "entry", url, message: "Choose a Plus or Pro seat in this browser window.", ...details };
       try {
@@ -559,6 +590,7 @@ export async function createChatShareBrowserController(
         throw new ChatShareBrowserError("invalid_prompt", `Prompt must contain text and be at most ${config.maxPromptChars} characters.`);
       }
       if (busy) throw new ChatShareBrowserError("busy", "Only one ChatShare request can run at a time.");
+      if (seatSetupIncomplete) throw new ChatShareBrowserError("not_ready", "ChatShare seat and GPT-6 model setup has not completed. No prompt was submitted.");
       const signal = options.signal;
       const deadline = Date.now() + config.turnTimeoutMs;
       checkDeadline(deadline, signal);
